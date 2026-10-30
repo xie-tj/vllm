@@ -84,6 +84,7 @@ def _check_online_mtp_generation(
         max_model_len=512,
         max_num_batched_tokens=128,
         max_num_seqs=2,
+        enable_chunked_prefill=True,
         enable_prefix_caching=False,
         limit_mm_per_prompt={"image": 0, "video": 0},
         attention_backend="TRITON_ATTN",

@@ -3,7 +3,7 @@
 
 import pytest
 
-from tests.utils import single_gpu_only
+from tests.utils import multi_gpu_test, single_gpu_only
 from vllm import SamplingParams
 from vllm.config import CompilationConfig, CUDAGraphMode
 from vllm.platforms import current_platform
@@ -56,6 +56,20 @@ def test_online_cost_feedback_preserves_constrained_mtp_generation(
     online_cost_feedback: bool,
 ):
     """Runtime timing and adaptive budgets must preserve constrained outputs."""
+    _check_online_mtp_generation(monkeypatch, vllm_runner, online_cost_feedback)
+
+
+@multi_gpu_test(num_gpus=2)
+def test_online_cost_feedback_tensor_parallel_generation(
+    monkeypatch: pytest.MonkeyPatch, vllm_runner, enable_pickle
+):
+    """TP followers obey the leader's calibrated verification decisions."""
+    _check_online_mtp_generation(monkeypatch, vllm_runner, True, tp_size=2)
+
+
+def _check_online_mtp_generation(
+    monkeypatch, vllm_runner, online_cost_feedback, tp_size=1
+):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "64")
     params = SamplingParams(
@@ -66,6 +80,7 @@ def test_online_cost_feedback_preserves_constrained_mtp_generation(
     )
     with vllm_runner(
         "Qwen/Qwen3.5-0.8B-Base",
+        tensor_parallel_size=tp_size,
         max_model_len=512,
         max_num_batched_tokens=128,
         max_num_seqs=2,
@@ -101,10 +116,11 @@ def test_online_cost_feedback_preserves_constrained_mtp_generation(
 
         observed_samples = runner.llm.collective_rpc(num_cost_samples)
         if online_cost_feedback:
-            assert len(observed_samples) == 1
+            assert len(observed_samples) == tp_size
             assert observed_samples[0] >= 10
+            assert observed_samples[1:] == [None] * (tp_size - 1)
         else:
-            assert observed_samples == [None]
+            assert observed_samples == [None] * tp_size
 
 
 @single_gpu_only

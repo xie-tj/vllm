@@ -1,19 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
+from dataclasses import replace
+from datetime import timedelta
 from threading import Event, Thread
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
-from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
+from tests.utils import multi_gpu_test
+from vllm.config import (
+    ParallelConfig,
+    SpeculativeConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import (
+    cleanup_dist_env_and_memory,
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.worker.gpu.async_utils import RuntimeTimingCollector, StepTimingSample
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
@@ -22,6 +40,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.states import RequestState
 
 
 def make_manager(
@@ -39,6 +58,7 @@ def make_manager(
     )
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager.online_cost_model = None
+    manager.synchronize_tp_decisions = False
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
     return manager
@@ -448,15 +468,133 @@ def test_online_cost_feedback_requires_adaptive_verification():
         SpeculativeConfig(enable_online_cost_feedback=True)
 
 
-def test_online_cost_feedback_rejects_target_tensor_parallelism():
-    with pytest.raises(ValueError, match="requires target tensor_parallel_size=1"):
-        SpeculativeConfig(
-            enable_online_cost_feedback=True,
-            enable_adaptive_verification=True,
-            target_parallel_config=ParallelConfig(
-                tensor_parallel_size=2, distributed_executor_backend="mp"
-            ),
+def test_online_cost_feedback_accepts_tensor_and_data_parallel_configuration():
+    config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=3,
+        enable_online_cost_feedback=True,
+        enable_adaptive_verification=True,
+        target_parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            data_parallel_size=2,
+            distributed_executor_backend="mp",
+        ),
+    )
+    assert config.enable_online_cost_feedback
+    assert config.target_parallel_config.tensor_parallel_size == 2
+    assert config.target_parallel_config.data_parallel_size == 2
+
+
+def _online_tp_dp_worker(rank: int, tp_size: int, store: str, feedback=True) -> None:
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="4")
+    dp_rank = rank // tp_size
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=tp_size,
+            data_parallel_size=4 // tp_size,
+            data_parallel_rank=dp_rank,
+            distributed_executor_backend="external_launcher",
         )
+    )
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=4,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{store}",
+            backend="nccl",
+            timeout=timedelta(seconds=90),
+        )
+        initialize_model_parallel(tp_size)
+        try:
+            states = RequestState(2, 16, 8, 1, 32, device)
+            for req_id in ("high", "low"):
+                states.add_request(req_id, 1, [0], 1, 15)
+            states.apply_staged_writes()
+            buffers = InputBuffers(2, 8, device)
+            batch = replace(
+                InputBatch.make_dummy(2, 4, buffers), req_ids=["low", "high"]
+            )
+            manager = AdaptiveVerificationManager(
+                states,
+                buffers.query_start_loc,
+                1,
+                8,
+                enable_online_cost_feedback=feedback,
+            )
+            list(manager.batches_to_profile([1, 2, 3, 4]))
+            group = get_tp_group()
+            up = float(np.nextafter(np.float32(0.5), np.float32(1)))
+            down = float(np.nextafter(np.float32(0.5), np.float32(0)))
+
+            def layout(stale, live, third_cost):
+                manager.set_cost_curves(
+                    [(1, 1.0), (2, 1.0)],
+                    [(1, 1.0), (2, 1.0), (3, third_cost), (4, 100.0)],
+                )
+                for values in (stale, stale, live):
+                    manager.record_confidences(
+                        torch.tensor(values, device=device, dtype=torch.float32), batch
+                    )
+                total = manager.get_num_tokens(
+                    {"low": 2, "high": 2}, {"low": [0], "high": [0]}
+                )
+                cu_logits, query_lens, *_ = manager.reallocate_drafts(
+                    batch.req_ids, batch.idx_mapping
+                )
+                return total, cu_logits.tolist(), query_lens[:3].tolist()
+
+            # One-ULP differences would choose different budgets without TP consensus.
+            first = up if (dp_rank == 0) == group.is_first_rank else down
+            budget_layout = layout([[first], [0.1]], [[first], [0.1]], 1.5)
+            assert budget_layout[0] == (3 if dp_rank == 0 else 2)
+
+            # Equal totals can still admit opposite requests on different TP ranks.
+            live = (
+                [[up], [down]]
+                if (dp_rank == 0) == group.is_first_rank
+                else [[down], [up]]
+            )
+            boundary_layout = layout([[0.5], [0.5]], live, 1.0)
+            assert boundary_layout[2] == ([0, 2, 3] if dp_rank == 0 else [0, 1, 3])
+
+            model = manager.online_cost_model
+            assert (model is not None) == (feedback and group.is_first_rank)
+            if model is not None:
+                model.update(
+                    [StepTimingSample(1 + 3 * (dp_rank + 1), 1, 3, 2, True)] * 10
+                )
+                assert model.num_samples == 10
+            # Followers have no local calibration, yet must obey the learned budget.
+            calibrated_total = manager.get_num_tokens(
+                {"low": 2, "high": 2}, {"low": [0], "high": [0]}
+            )
+            assert calibrated_total == (2 if feedback else 3)
+            layouts = [None] * 4
+            dist.all_gather_object(
+                layouts, (budget_layout, boundary_layout, calibrated_total)
+            )
+            for start in range(0, 4, tp_size):
+                assert all(
+                    row == layouts[start] for row in layouts[start : start + tp_size]
+                )
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@multi_gpu_test(num_gpus=4)
+def test_online_tp_dp_groups_agree_on_budget_and_request_boundaries(tp_size, tmp_path):
+    """TP shares decisions while DP replicas retain independent cost feedback."""
+    mp.spawn(_online_tp_dp_worker, args=(tp_size, str(tmp_path / "store")), nprocs=4)
+
+
+@multi_gpu_test(num_gpus=4)
+def test_online_tp_dp_consensus_remains_when_feedback_is_disabled(tmp_path):
+    """Turning off calibration must not reintroduce divergent TP layouts."""
+    mp.spawn(_online_tp_dp_worker, args=(2, str(tmp_path / "store"), False), nprocs=4)
 
 
 @triton.jit

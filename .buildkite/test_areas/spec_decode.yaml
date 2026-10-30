@@ -34,6 +34,22 @@ steps:
       depends_on:
       - image-build-amd
 
+- label: ":nvidia: (H100) Online AV TP and DP"
+  key: online-av-tp-dp
+  device: h100
+  num_devices: 4
+  timeout_in_minutes: 20
+  source_file_dependencies:
+    - vllm/config/speculative.py
+    - vllm/distributed/
+    - vllm/v1/worker/gpu/
+    - vllm/v1/worker/gpu_worker.py
+    - tests/v1/spec_decode/test_adaptive_verification.py
+    - tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
+  commands:
+    - pytest -v -s v1/spec_decode/test_adaptive_verification.py -k online_tp_dp
+    - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_online_cost_feedback_tensor_parallel_generation
+
 - label: ":nvidia: (H200 MIG 35GB) Spec Decode Eagle 1: DeepSeek + Qwen"
   key: spec-decode-eagle-1-deepseek-qwen
   timeout_in_minutes: 25

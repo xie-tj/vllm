@@ -2086,6 +2086,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and not is_profile
             and not self.runtime_profiling_active
             and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and input_batch.num_reqs > 0
             and not input_batch.is_prefilling_np.any()
             and not scheduler_output.skip_drafts
             and scheduler_output.num_spec_tokens_to_schedule

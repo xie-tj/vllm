@@ -616,7 +616,8 @@ class SpeculativeConfig:
 
     enable_online_cost_feedback: bool = False
     """Update adaptive verification costs from completed runtime measurements.
-    Requires enable_adaptive_verification and target tensor parallel size 1.
+    Requires enable_adaptive_verification. TP ranks share the leader's decisions;
+    dense DP replicas calibrate independently.
     Disabled by default; startup-profiled costs remain the fallback."""
 
     @staticmethod
@@ -1294,20 +1295,11 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
-        if self.enable_online_cost_feedback:
-            if not self.enable_adaptive_verification:
-                raise ValueError(
-                    "enable_online_cost_feedback requires "
-                    "enable_adaptive_verification=True."
-                )
-            if (
-                self.target_parallel_config is not None
-                and self.target_parallel_config.tensor_parallel_size != 1
-            ):
-                raise ValueError(
-                    "enable_online_cost_feedback requires target "
-                    "tensor_parallel_size=1."
-                )
+        if self.enable_online_cost_feedback and not self.enable_adaptive_verification:
+            raise ValueError(
+                "enable_online_cost_feedback requires "
+                "enable_adaptive_verification=True."
+            )
 
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter

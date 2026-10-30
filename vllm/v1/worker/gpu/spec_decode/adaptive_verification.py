@@ -318,8 +318,11 @@ class AdaptiveVerificationManager:
         self._max_total_logits = max_total_logits
         self.query_start_loc = query_start_loc
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
+        self.synchronize_tp_decisions = get_tp_group().world_size > 1
         self.runtime_timing = (
-            RuntimeTimingCollector() if enable_online_cost_feedback else None
+            RuntimeTimingCollector()
+            if enable_online_cost_feedback and get_tp_group().is_first_rank
+            else None
         )
         self.online_cost_model: OnlineCostModel | None = None
         # Largest cudagraph-captured token count; above it nothing pads.
@@ -551,6 +554,9 @@ class AdaptiveVerificationManager:
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
         draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        if self.synchronize_tp_decisions:
+            # Cost feedback and rank-local confidences must yield one TP budget.
+            draft_budget = get_tp_group().broadcast_object(draft_budget, src=0)
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
@@ -636,6 +642,9 @@ class AdaptiveVerificationManager:
                     draft_budget,
                     self._draft_survival,
                 )
+                if self.synchronize_tp_decisions:
+                    # Equal totals also need identical per-request boundaries.
+                    get_tp_group().broadcast(capacities, src=0)
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
@@ -700,17 +709,22 @@ def maybe_create_adaptive_verification_manager(
 
     parallel = vllm_config.parallel_config
     if online and (
-        parallel.tensor_parallel_size != 1
-        or parallel.data_parallel_size != 1
-        or parallel.prefill_context_parallel_size != 1
+        parallel.prefill_context_parallel_size != 1
         or parallel.decode_context_parallel_size != 1
         or parallel.enable_expert_parallel
         or parallel.use_ubatching
     ):
         raise ValueError(
-            "Online cost feedback currently requires TP=DP=PCP=DCP=1 "
+            "Online cost feedback currently requires PCP=DCP=1 "
             "without expert parallelism or microbatching."
         )
+    if (
+        online
+        and parallel.data_parallel_size > 1
+        and vllm_config.model_config is not None
+        and vllm_config.model_config.is_moe
+    ):
+        raise ValueError("Online cost feedback currently supports dense DP replicas.")
 
     # The selector rejects unsupported backends, but models that
     # hard-wire theirs (e.g. DeepSeek-V4) never go through it.

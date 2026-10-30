@@ -88,11 +88,21 @@ It changes cost estimates for the existing per-request verification budget;
 it does not introduce a separate batch-level draft-length policy. Startup-profiled
 costs remain the fallback until enough valid measurements are available.
 
-The first version supports a single target GPU: target TP=1, DP=1, PCP=DCP=1,
-with expert parallelism and dual-batch overlap disabled. It learns only from
-pure decode steps using FULL CUDA graphs; prefill and unsupported execution
-shapes retain startup costs. Existing adaptive-verification restrictions on
-attention backends, LoRA and pipeline parallelism still apply.
+Tensor parallelism is supported: TP rank 0 collects runtime samples, maintains
+the cost model and broadcasts the chosen budget. When the budget trims drafts,
+the admitted per-request counts are also broadcast before building the batch
+layout. This keeps execution shapes consistent despite rank-local timing or
+confidence differences. Other TP ranks do not run independent calibrators.
+Budget and layout consensus also applies when cost feedback is disabled.
+
+Dense data-parallel replicas learn independently within their own TP groups.
+For example, `--tensor-parallel-size 2 --data-parallel-size 4` uses eight GPUs
+with four independent cost models. MoE DP, expert parallelism, context
+parallelism and dual-batch overlap are currently unsupported by online feedback.
+It learns only from real pure-decode steps using FULL CUDA graphs; prefill,
+dummy steps and unsupported execution shapes retain startup costs. Existing
+adaptive-verification restrictions on attention backends, LoRA and pipeline
+parallelism still apply.
 
 Timing events are recorded around real forward and draft execution. Completed
 measurements are collected later with non-blocking event queries, so feedback

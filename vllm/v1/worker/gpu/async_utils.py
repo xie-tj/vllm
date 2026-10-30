@@ -114,27 +114,45 @@ class StepTimingCollector:
             self._step = None
 
 
+@dataclass(frozen=True)
+class RuntimeTimingSample:
+    forward_ms: float
+    sampler_ms: float
+    num_target_tokens: int
+    num_reqs: int
+
+
+@dataclass
+class _RuntimeTimingEvents:
+    forward_start: torch.cuda.Event = field(default_factory=_timing_event)
+    forward_end: torch.cuda.Event = field(default_factory=_timing_event)
+    sampler_start: torch.cuda.Event = field(default_factory=_timing_event)
+    sampler_end: torch.cuda.Event = field(default_factory=_timing_event)
+
+
 class RuntimeTimingCollector:
     """Samples eligible FULL decode steps without waiting for pending CUDA work."""
 
-    _SAMPLE_INTERVAL = 8
     _MAX_PENDING = 16
 
     def __init__(self) -> None:
-        self._eligible_steps = 0
-        self._active: tuple[StepTimingEvents, int, int] | None = None
-        self._pending: deque[tuple[StepTimingEvents, int, int]] = deque()
+        self._discard_pending = 0
+        self._active: tuple[_RuntimeTimingEvents, int, int] | None = None
+        self._pending: deque[
+            tuple[
+                _RuntimeTimingEvents,
+                int,
+                int,
+                tuple[torch.cuda.Event, ...],
+            ]
+        ] = deque()
 
     def start(self, num_target_tokens: int, num_reqs: int) -> None:
         """Start an eligible step using its actual padded token count."""
         self.cancel()
-        self._eligible_steps += 1
-        if (
-            self._eligible_steps % self._SAMPLE_INTERVAL != 0
-            or len(self._pending) >= self._MAX_PENDING
-        ):
+        if len(self._pending) >= self._MAX_PENDING:
             return
-        events = StepTimingEvents()
+        events = _RuntimeTimingEvents()
         events.forward_start.record()
         self._active = (events, num_target_tokens, num_reqs)
 
@@ -142,37 +160,69 @@ class RuntimeTimingCollector:
         if self._active is not None:
             self._active[0].forward_end.record()
 
-    def drafter_start(self) -> None:
+    def sampler_start(self) -> None:
         if self._active is not None:
-            self._active[0].drafter_start.record()
+            self._active[0].sampler_start.record()
 
-    def drafter_end(self) -> None:
+    def record_copy_end(
+        self, copy_stream: torch.cuda.Stream
+    ) -> torch.cuda.Event | None:
+        """Record a per-step marker without reusing the copy pipeline's events."""
+        if self._active is None:
+            return None
+        event = _timing_event()
+        event.record(copy_stream)
+        return event
+
+    def sampler_end(
+        self,
+        copy_event: torch.cuda.Event | None = None,
+        *additional_events: torch.cuda.Event | None,
+    ) -> tuple[torch.cuda.Event, ...] | None:
         if self._active is not None:
-            self._active[0].drafter_end.record()
-            self._pending.append(self._active)
+            events, num_tokens, num_reqs = self._active
+            events.sampler_end.record()
+            dependencies = tuple(
+                event
+                for event in (events.sampler_end, copy_event, *additional_events)
+                if event is not None
+            )
+            self._pending.append((events, num_tokens, num_reqs, dependencies))
             self._active = None
+            return dependencies
+        return None
 
-    def collect_ready(self) -> list[StepTimingSample]:
+    def collect_ready(self) -> list[RuntimeTimingSample]:
         """Drain the completed prefix without waiting for a CUDA event."""
-        samples: list[StepTimingSample] = []
+        samples: list[RuntimeTimingSample] = []
         while self._pending:
-            events, num_target_tokens, num_reqs = self._pending[0]
-            if not events.drafter_end.query():
+            events, num_target_tokens, num_reqs, completion_events = self._pending[0]
+            if not all(event.query() for event in completion_events):
                 break
             self._pending.popleft()
+            if self._discard_pending:
+                self._discard_pending -= 1
+                continue
             samples.append(
-                StepTimingSample(
+                RuntimeTimingSample(
                     forward_ms=events.forward_start.elapsed_time(events.forward_end),
-                    drafter_ms=events.drafter_start.elapsed_time(events.drafter_end),
+                    sampler_ms=max(
+                        events.sampler_start.elapsed_time(event)
+                        for event in completion_events
+                    ),
                     num_target_tokens=num_target_tokens,
                     num_reqs=num_reqs,
-                    full_cudagraph=True,
                 )
             )
         return samples
 
     def cancel(self) -> None:
         self._active = None
+
+    def invalidate(self) -> None:
+        """Discard observations across profiler transitions without recycling early."""
+        self.cancel()
+        self._discard_pending = len(self._pending)
 
 
 class AsyncOutput(AsyncModelRunnerOutput):

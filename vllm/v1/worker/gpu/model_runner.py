@@ -2249,6 +2249,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
+        if self.runtime_timing is not None:
+            self.runtime_timing.sampler_start()
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
@@ -2305,6 +2307,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
         )
+        output_copy_event = (
+            self.runtime_timing.record_copy_end(self.output_copy_stream)
+            if self.runtime_timing is not None
+            else None
+        )
 
         # Collect KV transfer results now; finalize saves after the drafter runs.
         defer_kv_finalize = self.speculator is not None
@@ -2330,6 +2337,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch, draft_lookahead=1
             )
 
+        confidence_copy_event = None
         # Postprocess results and update request states.
         # NOTE: This is intentionally done after creating the AsyncOutput,
         # ensuring that `copy_event` is recorded before calling postprocess.
@@ -2352,8 +2360,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = get_drafter_hidden_states(
                 self.model, draft_hidden_states
             )
-            if self.runtime_timing is not None:
-                self.runtime_timing.drafter_start()
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2371,8 +2377,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
-            if self.runtime_timing is not None:
-                self.runtime_timing.drafter_end()
             if self.pcp_manager is not None:
                 self.pcp_manager.sync_drafts(
                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
@@ -2381,7 +2385,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
-                self.adaptive_verification.record_confidences(
+                confidence_copy_event = self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
@@ -2400,6 +2404,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.finalize_step()
         model_runner_output.ec_connector_output = ec_connector_output
 
+        if self.runtime_timing is not None:
+            self.runtime_timing.sampler_end(
+                output_copy_event,
+                confidence_copy_event,
+                self.runtime_timing.record_copy_end(
+                    self.draft_tokens_handler.copy_stream
+                )
+                if input_batch.has_structured_output_reqs
+                else None,
+            )
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

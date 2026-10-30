@@ -55,7 +55,7 @@ def test_online_cost_feedback_preserves_constrained_mtp_generation(
     enable_pickle,
     online_cost_feedback: bool,
 ):
-    """Runtime timing and adaptive budgets must preserve constrained outputs."""
+    """Full sampler timing and adaptive budgets preserve constrained outputs."""
     _check_online_mtp_generation(monkeypatch, vllm_runner, online_cost_feedback)
 
 
@@ -117,6 +117,7 @@ def _check_online_mtp_generation(
         observed_samples = runner.llm.collective_rpc(num_cost_samples)
         if online_cost_feedback:
             assert len(observed_samples) == tp_size
+            # Real decode steps feed forward and full-sampler observations.
             assert observed_samples[0] >= 10
             assert observed_samples[1:] == [None] * (tp_size - 1)
         else:

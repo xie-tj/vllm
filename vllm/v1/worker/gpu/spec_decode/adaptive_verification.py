@@ -4,6 +4,7 @@
 
 from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -20,6 +21,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.async_utils import (
     RuntimeTimingCollector,
+    RuntimeTimingSample,
     StepTimingSample,
     stream,
 )
@@ -228,8 +230,136 @@ class AdmittedDraftCounts:
         return self._cpu.numpy()
 
 
+@dataclass
+class _MedianNode:
+    value: float
+    count: int = 1
+    size: int = 1
+    height: int = 1
+    left: "_MedianNode | None" = None
+    right: "_MedianNode | None" = None
+
+
+class _MedianTracker:
+    """An AVL multiset with logarithmic insert, removal and median lookup."""
+
+    def __init__(self) -> None:
+        self._root: _MedianNode | None = None
+
+    def __len__(self) -> int:
+        return self._size(self._root)
+
+    @staticmethod
+    def _size(node: _MedianNode | None) -> int:
+        return node.size if node is not None else 0
+
+    @staticmethod
+    def _height(node: _MedianNode | None) -> int:
+        return node.height if node is not None else 0
+
+    @classmethod
+    def _refresh(cls, node: _MedianNode) -> None:
+        node.size = node.count + cls._size(node.left) + cls._size(node.right)
+        node.height = 1 + max(cls._height(node.left), cls._height(node.right))
+
+    @classmethod
+    def _rotate_left(cls, node: _MedianNode) -> _MedianNode:
+        pivot = node.right
+        assert pivot is not None
+        node.right, pivot.left = pivot.left, node
+        cls._refresh(node)
+        cls._refresh(pivot)
+        return pivot
+
+    @classmethod
+    def _rotate_right(cls, node: _MedianNode) -> _MedianNode:
+        pivot = node.left
+        assert pivot is not None
+        node.left, pivot.right = pivot.right, node
+        cls._refresh(node)
+        cls._refresh(pivot)
+        return pivot
+
+    @classmethod
+    def _balance(cls, node: _MedianNode) -> _MedianNode:
+        cls._refresh(node)
+        if cls._height(node.left) > cls._height(node.right) + 1:
+            assert node.left is not None
+            if cls._height(node.left.left) < cls._height(node.left.right):
+                node.left = cls._rotate_left(node.left)
+            return cls._rotate_right(node)
+        if cls._height(node.right) > cls._height(node.left) + 1:
+            assert node.right is not None
+            if cls._height(node.right.right) < cls._height(node.right.left):
+                node.right = cls._rotate_right(node.right)
+            return cls._rotate_left(node)
+        return node
+
+    @classmethod
+    def _insert(cls, node: _MedianNode | None, value: float) -> _MedianNode:
+        if node is None:
+            return _MedianNode(value)
+        if value < node.value:
+            node.left = cls._insert(node.left, value)
+        elif value > node.value:
+            node.right = cls._insert(node.right, value)
+        else:
+            node.count += 1
+        return cls._balance(node)
+
+    @classmethod
+    def _erase(
+        cls, node: _MedianNode | None, value: float, count: int = 1
+    ) -> _MedianNode | None:
+        assert node is not None
+        if value < node.value:
+            node.left = cls._erase(node.left, value, count)
+        elif value > node.value:
+            node.right = cls._erase(node.right, value, count)
+        elif node.count > count:
+            node.count -= count
+        elif node.left is None:
+            return node.right
+        elif node.right is None:
+            return node.left
+        else:
+            successor = node.right
+            while successor.left is not None:
+                successor = successor.left
+            node.value, node.count = successor.value, successor.count
+            node.right = cls._erase(node.right, successor.value, successor.count)
+        return cls._balance(node)
+
+    def add(self, value: float) -> None:
+        self._root = self._insert(self._root, value)
+
+    def remove(self, value: float) -> None:
+        self._root = self._erase(self._root, value)
+
+    def _select(self, index: int) -> float:
+        node = self._root
+        while node is not None:
+            left_size = self._size(node.left)
+            if index < left_size:
+                node = node.left
+            elif index < left_size + node.count:
+                return node.value
+            else:
+                index -= left_size + node.count
+                node = node.right
+        raise IndexError(index)
+
+    def median(self) -> float:
+        size = len(self)
+        assert size > 0
+        middle = size // 2
+        if size % 2:
+            return self._select(middle)
+        return self._select(middle - 1) * 0.5 + self._select(middle) * 0.5
+
+
 class OnlineCostModel:
-    """Calibrate full-graph decode costs while retaining the startup fallback."""
+    """Maintain DeepInfer-style forward and full-sampler runtime estimates."""
 
     def __init__(
         self,
@@ -240,58 +370,80 @@ class OnlineCostModel:
         self.draft_cost = draft_cost
         self.verify_cost = verify_cost
         self.graph_sizes = np.asarray(graph_sizes)
-        self._forward_samples: deque[tuple[int, float]] = deque(maxlen=5000)
-        self._draft_samples: dict[int, deque[float]] = defaultdict(
+        self._valid_graph_sizes = set(graph_sizes)
+        self._forward_samples: deque[tuple[int, float]] = deque()
+        self._forward_by_size: dict[int, _MedianTracker] = defaultdict(_MedianTracker)
+        self._forward_medians = _MedianTracker()
+        self._sampler_samples: dict[int, deque[float]] = defaultdict(
             lambda: deque(maxlen=9)
         )
+        self._sampler_fallback: deque[float] = deque(maxlen=9)
         self._slope = 0.0
-        self._draft_ms: dict[int, float] = {}
 
     @property
     def num_samples(self) -> int:
         return len(self._forward_samples)
 
-    def update(self, samples: list[StepTimingSample]) -> None:
+    def _update_forward(self, size: int, residual: float, *, insert: bool) -> None:
+        values = self._forward_by_size[size]
+        if len(values) >= 10:
+            self._forward_medians.remove(values.median())
+        if insert:
+            values.add(residual)
+        else:
+            values.remove(residual)
+        if len(values) >= 10:
+            self._forward_medians.add(values.median())
+        elif not values:
+            del self._forward_by_size[size]
+
+    def update(self, samples: list[RuntimeTimingSample]) -> None:
         for sample in samples:
             size, reqs = sample.num_target_tokens, sample.num_reqs
             if (
-                not sample.full_cudagraph
-                or size not in self.graph_sizes
+                size not in self._valid_graph_sizes
+                or not 0 < size < len(self.verify_cost)
                 or not 0 < reqs < len(self.draft_cost)
-                or not np.isfinite([sample.forward_ms, sample.drafter_ms]).all()
-                or min(sample.forward_ms, sample.drafter_ms) <= 0
+                or not np.isfinite([sample.forward_ms, sample.sampler_ms]).all()
+                or min(sample.forward_ms, sample.sampler_ms) <= 0
             ):
                 continue
-            residual = (sample.forward_ms - self.verify_cost[size]) / size
+            residual = float((sample.forward_ms - self.verify_cost[size]) / size)
+            if not np.isfinite(residual):
+                continue
+            if len(self._forward_samples) == 5000:
+                old_size, old_residual = self._forward_samples.popleft()
+                self._update_forward(old_size, old_residual, insert=False)
             self._forward_samples.append((size, residual))
-            values = self._draft_samples[reqs]
-            values.append(sample.drafter_ms)
-            if len(values) >= 5:
-                self._draft_ms[reqs] = float(np.median(values))
+            self._update_forward(size, residual, insert=True)
+            self._sampler_samples[reqs].append(sample.sampler_ms)
+            self._sampler_fallback.append(sample.sampler_ms)
 
-        grouped: dict[int, list[float]] = defaultdict(list)
-        for size, residual in self._forward_samples:
-            grouped[size].append(residual)
-        medians = [
-            np.median(values) for values in grouped.values() if len(values) >= 10
-        ]
-        self._slope = max(0.0, float(np.median(medians))) if medians else 0.0
-        if medians:
+        self._slope = (
+            max(0.0, self._forward_medians.median()) if self._forward_medians else 0.0
+        )
+        if self._forward_medians:
             logger.info_once("Online adaptive verification cost feedback calibrated.")
         logger.debug(
-            "Online AV costs: samples=%d, forward_slope_ms=%g, draft_ms=%s",
+            "Online AV costs: samples=%d, forward_slope_ms=%g",
             len(self._forward_samples),
             self._slope,
-            self._draft_ms,
         )
+
+    def _sampler_ms(self, num_reqs: int) -> float:
+        values = self._sampler_samples.get(num_reqs)
+        if values is None or len(values) < 5:
+            values = self._sampler_fallback
+        return float(np.median(values)) if len(values) >= 5 else 0.0
 
     def get_costs(self, num_reqs: int, num_tokens: np.ndarray) -> np.ndarray:
         costs = self.draft_cost[num_reqs] + self.verify_cost[num_tokens]
         full = num_tokens <= self.graph_sizes[-1]
         padded = self.graph_sizes[np.searchsorted(self.graph_sizes, num_tokens[full])]
-        costs[full] += self._slope * padded + (
-            self._draft_ms.get(num_reqs, self.draft_cost[num_reqs])
-            - self.draft_cost[num_reqs]
+        costs[full] = (
+            self.verify_cost[num_tokens[full]]
+            + self._slope * padded
+            + self._sampler_ms(num_reqs)
         )
         return np.maximum(costs, 1e-6)
 
@@ -457,7 +609,7 @@ class AdaptiveVerificationManager:
 
     def record_confidences(
         self, confidence_probs: torch.Tensor, input_batch: "InputBatch"
-    ) -> None:
+    ) -> torch.cuda.Event | None:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
         num_reqs = input_batch.num_reqs
@@ -480,6 +632,11 @@ class AdaptiveVerificationManager:
         with stream(self._copy_stream, current_stream):
             write_slot.copy_to_cpu()
             self._copy_events[write_idx].record()
+        return (
+            self.runtime_timing.record_copy_end(self._copy_stream)
+            if self.runtime_timing is not None
+            else None
+        )
 
     def get_num_tokens(
         self,
@@ -537,7 +694,11 @@ class AdaptiveVerificationManager:
                 + 1
             ]
         )
-        if self.online_cost_model is not None and not has_prefill:
+        if (
+            self.online_cost_model is not None
+            and not has_prefill
+            and num_non_draft_tokens_total + max_draft_budget <= self._cudagraph_limit
+        ):
             costs = self.online_cost_model.get_costs(
                 num_reqs,
                 np.arange(

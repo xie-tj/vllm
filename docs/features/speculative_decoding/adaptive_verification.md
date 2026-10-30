@@ -81,12 +81,43 @@ configuration, enable it with:
 }
 ```
 
-The feedback uses a DeepInfer-inspired robust estimator with vLLM's existing
-forward and draft boundaries: it fits a non-negative forward-cost slope and
-uses median draft costs by request count.
-It changes cost estimates for the existing per-request verification budget;
-it does not introduce a separate batch-level draft-length policy. Startup-profiled
-costs remain the fallback until enough valid measurements are available.
+The feedback uses a DeepInfer-inspired robust estimator: it adds a non-negative
+forward-cost correction per physical token to the startup forward curve, then
+adds a runtime sampler estimate. It changes costs for the existing per-request
+verification budget, rather than introducing a separate batch-level draft-length
+policy.
+
+Here, **sampler** means the entire real `sample_tokens` stage, starting immediately
+before target logits and verification/sampling. It includes state updates,
+`prepare_propose`, MTP or other draft proposal, confidence publication, draft
+handling and KV finalization before the function returns. Its completion envelope
+uses independent per-step timing markers on the existing main, output-copy,
+confidence-copy and, for structured outputs, draft-copy streams. Once all markers
+have completed, sampler time is the maximum elapsed time from sampler start to
+each completion marker. Overlapping copies and draft execution are not added
+together. Measurement creates no extra streams or stream dependencies, so it
+does not introduce cross-step FIFO waits or new inference waits. The markers
+are separate from the copy pipelines' reusable synchronization events.
+This measures only those dependencies,
+not HTTP end-to-end latency, CPU response processing, or independent KV connector
+and other background work that has not joined the measured streams.
+
+For FULL-graph costs, the sampler estimate uses the latest nine completed samples
+for the current request count, once that bucket has at least five samples. A
+sparse or unseen bucket falls back to the median of the latest nine samples
+across request counts, also requiring five samples. Before that, the estimate is
+zero: FULL-graph costs do not fall back to the startup draft curve. Eager,
+prefill and feedback-disabled paths retain the existing startup costs.
+If any candidate verification budget exceeds the CUDA-graph capture limit, the
+entire budget decision uses the old costs. This avoids comparing the new
+full-sampler cost with the old eager-path cost within one decision.
+
+Forward corrections use at most 5,000 completed samples. Each physical-token-size
+bucket needs ten samples before its median per-token residual contributes to the
+median slope; the correction is zero before any bucket is ready and is clamped to be
+non-negative. The forward medians are maintained incrementally with logarithmic
+updates, without a new package dependency. A cold sampler bucket can therefore
+use the global estimate while its forward correction is still zero.
 
 Tensor parallelism is supported: TP rank 0 collects runtime samples, maintains
 the cost model and broadcasts the chosen budget. When the budget trims drafts,
@@ -104,8 +135,13 @@ dummy steps and unsupported execution shapes retain startup costs. Existing
 adaptive-verification restrictions on attention backends, LoRA and pipeline
 parallelism still apply.
 
-Timing events are recorded around real forward and draft execution. Completed
-measurements are collected later with non-blocking event queries, so feedback
-does not wait for a running draft to finish. Async scheduling remains supported.
+Every eligible step attempts a timing sample. The pending queue holds at most
+16 samples; when it is full, new samples are skipped rather than blocking, so
+this is not a guarantee that every step is retained. Completed measurements are
+collected later with non-blocking event queries. Feedback does not wait for a
+running sampler or draft to finish, and async scheduling remains supported.
 vLLM-managed profiler sessions are excluded from feedback: their timing overhead
 must not become the serving cost estimate.
+When profiling starts or stops, active and pending feedback samples are discarded
+so measurements spanning a profiler session cannot enter the cost model. Pending
+GPU work still completes before its timing markers are released.

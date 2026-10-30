@@ -5,6 +5,7 @@ import os
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import timedelta
+from statistics import median
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -30,7 +31,11 @@ from vllm.distributed import (
 )
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
-from vllm.v1.worker.gpu.async_utils import RuntimeTimingCollector, StepTimingSample
+from vllm.v1.worker.gpu.async_utils import (
+    RuntimeTimingCollector,
+    RuntimeTimingSample,
+    StepTimingSample,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -393,38 +398,56 @@ def test_draft_budget_kernel_admits_exact_budget_on_ties():
 def _online_cost_model() -> OnlineCostModel:
     # Startup prices are flat inside captured shapes and unpadded above 16.
     verify = np.array([0] + [4] * 4 + [8] * 4 + [16] * 8 + list(range(17, 33)))
-    return OnlineCostModel(np.array([0.0, 2.0, 4.0]), verify.astype(float), [4, 8, 16])
+    return OnlineCostModel(
+        np.array([0.0, 2.0, 4.0, 6.0]), verify.astype(float), [4, 8, 16]
+    )
 
 
 def test_online_cost_feedback_waits_for_evidence_and_prices_padded_shapes():
     model = _online_cost_model()
     candidates = np.array([1, 4, 5, 8, 9, 16, 17])
-    initial = np.array([6, 6, 10, 10, 18, 18, 19])
-    samples = [StepTimingSample(16.0, 2.0, 8, 1, True)]
+    np.testing.assert_array_equal(
+        model.get_costs(1, candidates), [4, 4, 8, 8, 16, 16, 19]
+    )
+    samples = [RuntimeTimingSample(16.0, 2.0, 8, 1)]
 
     model.update(samples * 9)
     assert model.num_samples == 9
-    np.testing.assert_array_equal(model.get_costs(1, candidates), initial)
+    np.testing.assert_array_equal(
+        model.get_costs(1, candidates), [6, 6, 10, 10, 18, 18, 19]
+    )
     model.update(samples)
     assert model.num_samples == 10
     np.testing.assert_array_equal(
         model.get_costs(1, candidates), [10, 10, 18, 18, 34, 34, 19]
     )
-    # A request-count bucket without observations retains its startup draft cost.
-    np.testing.assert_array_equal(model.get_costs(2, np.array([8, 17])), [20, 21])
+    # Unseen request counts use global sampler observations for FULL graphs,
+    # while eager candidates retain their original startup draft cost.
+    np.testing.assert_array_equal(model.get_costs(2, np.array([8, 17])), [18, 21])
 
 
-def test_online_draft_cost_uses_five_samples_then_a_nine_sample_median():
+def test_online_sampler_cost_uses_bucket_global_and_zero_fallbacks():
     model = _online_cost_model()
     candidates = np.array([4, 17])
-    high = StepTimingSample(4.0, 20.0, 4, 1, True)
+    high = RuntimeTimingSample(4.0, 100.0, 4, 1)
+    low = RuntimeTimingSample(4.0, 10.0, 4, 2)
     model.update([high] * 4)
-    np.testing.assert_array_equal(model.get_costs(1, candidates), [6, 19])
+    np.testing.assert_array_equal(model.get_costs(1, candidates), [4, 19])
+    model.update([low])
+    np.testing.assert_array_equal(model.get_costs(3, candidates), [104, 23])
+    model.update([low] * 3)
+    np.testing.assert_array_equal(model.get_costs(1, candidates), [59, 19])
     model.update([high])
-    np.testing.assert_array_equal(model.get_costs(1, candidates), [24, 19])
-    model.update([high] * 4)
-    model.update([StepTimingSample(4.0, 2.0, 4, 1, True)] * 5)
-    np.testing.assert_array_equal(model.get_costs(1, candidates), [6, 19])
+    model.update([low] * 4)
+    np.testing.assert_array_equal(model.get_costs(1, candidates), [104, 19])
+    np.testing.assert_array_equal(model.get_costs(2, candidates), [14, 21])
+    np.testing.assert_array_equal(model.get_costs(3, candidates), [14, 23])
+    # Five new observations displace four of the old bucket's nine entries.
+    # The unseen bucket also follows the global nine-entry window.
+    model.update([RuntimeTimingSample(4.0, 1.0, 4, 1)] * 5)
+    np.testing.assert_array_equal(model.get_costs(1, candidates), [5, 19])
+    np.testing.assert_array_equal(model.get_costs(2, candidates), [14, 21])
+    np.testing.assert_array_equal(model.get_costs(3, candidates), [5, 23])
 
 
 def test_online_forward_cost_balances_shapes_and_forgets_old_observations():
@@ -432,35 +455,111 @@ def test_online_forward_cost_balances_shapes_and_forgets_old_observations():
     # Per-shape residual medians are 1, 3, and 6 ms/token. The hot shape must
     # not dominate the median, and one high outlier must not dominate shape 4.
     model.update(
-        [StepTimingSample(8.0, 2.0, 4, 1, True)] * 9
-        + [StepTimingSample(4000.0, 2.0, 4, 1, True)]
-        + [StepTimingSample(32.0, 2.0, 8, 1, True)] * 10
-        + [StepTimingSample(112.0, 2.0, 16, 1, True)] * 20
+        [RuntimeTimingSample(8.0, 2.0, 4, 1)] * 9
+        + [RuntimeTimingSample(4000.0, 2.0, 4, 1)]
+        + [RuntimeTimingSample(32.0, 2.0, 8, 1)] * 10
+        + [RuntimeTimingSample(112.0, 2.0, 16, 1)] * 20
     )
     np.testing.assert_array_equal(
         model.get_costs(1, np.array([1, 5, 9, 17])), [18, 34, 66, 19]
     )
     # A full new window evicts all old shapes. Faster forwards never create
     # a negative correction to the startup price.
-    model.update([StepTimingSample(4.0, 2.0, 8, 1, True)] * 5000)
+    model.update([RuntimeTimingSample(4.0, 2.0, 8, 1)] * 5000)
     np.testing.assert_array_equal(
         model.get_costs(1, np.array([1, 5, 9, 17])), [6, 10, 18, 19]
     )
 
 
 @pytest.mark.parametrize(
-    ("forward_ms", "drafter_ms"),
+    ("forward_ms", "sampler_ms"),
     [(float("nan"), 20.0), (16.0, float("inf")), (0.0, 20.0), (16.0, -1.0)],
 )
 def test_online_cost_feedback_ignores_an_invalid_timing_entirely(
-    forward_ms, drafter_ms
+    forward_ms, sampler_ms
 ):
     model = _online_cost_model()
-    model.update([StepTimingSample(16.0, 20.0, 8, 1, True)] * 4)
-    model.update([StepTimingSample(forward_ms, drafter_ms, 8, 1, True)] * 10)
-    model.update([StepTimingSample(16.0, 20.0, 7, 1, True)] * 10)
-    model.update([StepTimingSample(16.0, 20.0, 8, 1, False)] * 10)
-    np.testing.assert_array_equal(model.get_costs(1, np.array([8, 17])), [10, 19])
+    model.update([RuntimeTimingSample(16.0, 20.0, 8, 1)] * 4)
+    model.update([RuntimeTimingSample(forward_ms, sampler_ms, 8, 1)] * 10)
+    model.update([RuntimeTimingSample(16.0, 20.0, 7, 1)] * 10)
+    model.update([RuntimeTimingSample(16.0, 20.0, 8, 0)] * 10)
+    assert model.num_samples == 4
+    np.testing.assert_array_equal(model.get_costs(1, np.array([8, 17])), [8, 19])
+
+
+def _reference_online_costs(history, num_reqs, candidates):
+    """Recompute from complete histories, without incremental median state."""
+    forward = {}
+    for sample in history[-5000:]:
+        size = sample.num_target_tokens
+        forward.setdefault(size, []).append((sample.forward_ms - size) / size)
+    shape_medians = [median(values) for values in forward.values() if len(values) >= 10]
+    slope = max(0.0, median(shape_medians)) if shape_medians else 0.0
+    local = [sample.sampler_ms for sample in history if sample.num_reqs == num_reqs][
+        -9:
+    ]
+    global_samples = [sample.sampler_ms for sample in history][-9:]
+    sampler = (
+        median(local)
+        if len(local) >= 5
+        else median(global_samples)
+        if len(global_samples) >= 5
+        else 0.0
+    )
+    expected = []
+    for tokens in candidates:
+        if tokens > 16:
+            expected.append([0, 2, 4, 6][num_reqs] + tokens)
+        else:
+            padded = next(size for size in [4, 8, 16] if tokens <= size)
+            expected.append(padded + slope * padded + sampler)
+    return np.array(expected)
+
+
+def test_incremental_cost_medians_match_recomputation_across_evictions():
+    model = _online_cost_model()
+    observations = []
+    for index in range(5040):
+        size = [4, 8, 16][(index // 7) % 3]
+        residual = [-0.5, 0.0, 0.5, 1.0, 1.0][index % 5]
+        observations.append(
+            RuntimeTimingSample(
+                size * (1 + residual),
+                [1.0, 1.0, 3.0, 9.0][index % 4],
+                size,
+                1 + index % 3,
+            )
+        )
+    candidates = np.array([1, 4, 5, 8, 9, 16, 17])
+    checkpoints = [
+        1,
+        4,
+        5,
+        9,
+        10,
+        11,
+        20,
+        29,
+        40,
+        50,
+        100,
+        4999,
+        5000,
+        5001,
+        5010,
+        5040,
+    ]
+    previous = 0
+    for count in checkpoints:
+        model.update(observations[previous:count])
+        previous = count
+        assert model.num_samples == min(count, 5000)
+        for num_reqs in [1, 2, 3]:
+            np.testing.assert_array_equal(
+                model.get_costs(num_reqs, candidates),
+                _reference_online_costs(observations[:count], num_reqs, candidates),
+                err_msg=f"after {count} samples, request bucket {num_reqs}",
+            )
 
 
 def test_online_cost_feedback_requires_adaptive_verification():
@@ -548,7 +647,10 @@ def _online_tp_dp_worker(rank: int, tp_size: int, store: str, feedback=True) -> 
 
             # One-ULP differences would choose different budgets without TP consensus.
             first = up if (dp_rank == 0) == group.is_first_rank else down
-            budget_layout = layout([[first], [0.1]], [[first], [0.1]], 1.5)
+            # At acceptance 0.5, FULL's initial zero sampler cost ties at 1.25;
+            # the fixed startup draft cost of 1 ties at 1.5 instead.
+            tie_cost = 1.25 if feedback else 1.5
+            budget_layout = layout([[first], [0.1]], [[first], [0.1]], tie_cost)
             assert budget_layout[0] == (3 if dp_rank == 0 else 2)
 
             # Equal totals can still admit opposite requests on different TP ranks.
@@ -563,18 +665,34 @@ def _online_tp_dp_worker(rank: int, tp_size: int, store: str, feedback=True) -> 
             model = manager.online_cost_model
             assert (model is not None) == (feedback and group.is_first_rank)
             if model is not None:
-                model.update(
-                    [StepTimingSample(1 + 3 * (dp_rank + 1), 1, 3, 2, True)] * 10
-                )
+                model.update([RuntimeTimingSample(1 + 3 * (dp_rank + 1), 1, 3, 2)] * 10)
                 assert model.num_samples == 10
             # Followers have no local calibration, yet must obey the learned budget.
             calibrated_total = manager.get_num_tokens(
                 {"low": 2, "high": 2}, {"low": [0], "high": [0]}
             )
             assert calibrated_total == (2 if feedback else 3)
+
+            # A decision spanning FULL and eager must keep the same startup
+            # cost basis. Mixing a learned FULL slope with the old eager price
+            # would choose only two tokens in this example instead of three.
+            list(manager.batches_to_profile([1, 2, 3]))
+            manager.set_cost_curves(
+                [(1, 1.0), (2, 1.0)],
+                [(1, 1.0), (2, 1.0), (3, 1.0), (4, 100.0)],
+            )
+            if manager.online_cost_model is not None:
+                manager.online_cost_model.update(
+                    [RuntimeTimingSample(31.0, 1.0, 3, 2)] * 10
+                )
+            mixed_range_total = manager.get_num_tokens(
+                {"low": 2, "high": 2}, {"low": [0], "high": [0]}
+            )
+            assert mixed_range_total == 3
             layouts = [None] * 4
             dist.all_gather_object(
-                layouts, (budget_layout, boundary_layout, calibrated_total)
+                layouts,
+                (budget_layout, boundary_layout, calibrated_total, mixed_range_total),
             )
             for start in range(0, 4, tp_size):
                 assert all(
@@ -605,21 +723,121 @@ def _wait_for_runtime_timing_release(flag):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 def test_runtime_timing_keeps_pending_events_without_waiting_or_overwriting():
+    """Output-copy completion gates timing reuse without holding the main stream."""
     collector = RuntimeTimingCollector()
     flag = torch.ones((), dtype=torch.int32, device="cuda")
+    source = torch.arange(4, dtype=torch.int32, device="cuda")
+    output = torch.empty(4, dtype=torch.int32, pin_memory=True)
+    sampler_work = torch.zeros((), device="cuda")
     # Compile before holding the sampling stream: compilation may synchronize.
     _wait_for_runtime_timing_release[(1,)](flag, num_warps=1)
+    sampler_work.add_(1)
+    output.copy_(source, non_blocking=True)
     torch.accelerator.synchronize()
     flag.zero_()
     initialized = torch.cuda.Event()
     initialized.record()
     sampling_stream = torch.cuda.Stream()
+    copy_stream = torch.cuda.Stream()
     release_stream = torch.cuda.Stream()
     sampling_stream.wait_event(initialized)
+    copy_stream.wait_event(initialized)
     release_stream.wait_event(initialized)
+    copy_done = torch.cuda.Event(enable_timing=True)
+    sampler_reference = torch.cuda.Event(enable_timing=True)
     queued = torch.cuda.Event()
     returned = Event()
-    polled: list[list[StepTimingSample]] = []
+    polled: list[list[RuntimeTimingSample]] = []
+    errors: list[Exception] = []
+
+    def poll():
+        try:
+            # A sampler_end implementation must not put the copy dependency on
+            # the main stream, and collect_ready must not synchronize it either.
+            queued.synchronize()
+            polled.append(collector.collect_ready())
+        except Exception as error:
+            errors.append(error)
+        finally:
+            returned.set()
+
+    thread = Thread(target=poll, daemon=True)
+    try:
+        with torch.cuda.stream(copy_stream):
+            _wait_for_runtime_timing_release[(1,)](flag, num_warps=1)
+            output.copy_(source, non_blocking=True)
+            copy_done.record()
+        with torch.cuda.stream(sampling_stream):
+            for sample in range(1, 18):
+                collector.start(num_target_tokens=sample * 8, num_reqs=1)
+                collector.forward_end()
+                collector.sampler_start()
+                if sample == 1:
+                    sampler_reference.record()
+                sampler_work.add_(1)
+                collector.sampler_end(copy_event=copy_done)
+            queued.record()
+        assert not copy_done.query()
+        thread.start()
+        returned_before_release = returned.wait(timeout=5)
+    finally:
+        with torch.cuda.stream(release_stream):
+            flag.fill_(1)
+        release_stream.synchronize()
+        copy_stream.synchronize()
+        sampling_stream.synchronize()
+        torch.accelerator.synchronize()
+        if thread.ident is not None:
+            thread.join(timeout=5)
+
+    assert returned_before_release, "timing collection blocked the main stream or host"
+    assert not errors
+    assert polled == [[]]
+    completed = collector.collect_ready()
+    assert [sample.num_target_tokens for sample in completed] == list(range(8, 129, 8))
+    assert all(isinstance(sample, RuntimeTimingSample) for sample in completed)
+    assert all(sample.num_reqs == 1 for sample in completed)
+    assert all(
+        sample.forward_ms >= 0 and sample.sampler_ms >= 0 for sample in completed
+    )
+    assert completed[0].sampler_ms >= sampler_reference.elapsed_time(copy_done)
+    assert output.tolist() == [0, 1, 2, 3]
+    assert collector.collect_ready() == []
+
+    collector.start(num_target_tokens=8, num_reqs=1)
+    collector.cancel()
+    collector.forward_end()
+    collector.sampler_start()
+    collector.sampler_end()
+    torch.accelerator.synchronize()
+    assert collector.collect_ready() == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+def test_runtime_timing_completion_survives_a_reused_copy_event():
+    """A later copy must not turn a completed sample back into pending work."""
+    collector = RuntimeTimingCollector()
+    flag = torch.ones((), dtype=torch.int32, device="cuda")
+    _wait_for_runtime_timing_release[(1,)](flag, num_warps=1)
+    copy_done = torch.cuda.Event()
+    collector.start(num_target_tokens=8, num_reqs=1)
+    collector.forward_end()
+    collector.sampler_start()
+    copy_done.record()
+    copy_marker = collector.record_copy_end(torch.cuda.current_stream())
+    assert copy_marker is not None
+    collector.sampler_end(copy_event=copy_marker)
+    torch.accelerator.synchronize()
+
+    flag.zero_()
+    initialized = torch.cuda.Event()
+    initialized.record()
+    later_copy = torch.cuda.Stream()
+    release_stream = torch.cuda.Stream()
+    later_copy.wait_event(initialized)
+    release_stream.wait_event(initialized)
+    returned = Event()
+    polled: list[list[RuntimeTimingSample]] = []
     errors: list[Exception] = []
 
     def poll():
@@ -632,42 +850,90 @@ def test_runtime_timing_keeps_pending_events_without_waiting_or_overwriting():
 
     thread = Thread(target=poll, daemon=True)
     try:
-        with torch.cuda.stream(sampling_stream):
+        with torch.cuda.stream(later_copy):
             _wait_for_runtime_timing_release[(1,)](flag, num_warps=1)
-            for sample in range(1, 18):
-                for _ in range(8):
-                    collector.start(num_target_tokens=sample * 8, num_reqs=1)
-                    collector.forward_end()
-                    collector.drafter_start()
-                    collector.drafter_end()
-            queued.record()
-        assert not queued.query()
+            copy_done.record()
+        assert not copy_done.query()
         thread.start()
         returned_before_release = returned.wait(timeout=5)
     finally:
         with torch.cuda.stream(release_stream):
             flag.fill_(1)
         release_stream.synchronize()
-        sampling_stream.synchronize()
+        later_copy.synchronize()
+        torch.accelerator.synchronize()
         if thread.ident is not None:
             thread.join(timeout=5)
 
-    assert returned_before_release, "collect_ready blocked on unfinished GPU work"
+    assert returned_before_release, "reused copy event blocked an old timing sample"
     assert not errors
-    assert polled == [[]]
-    completed = collector.collect_ready()
-    assert [sample.num_target_tokens for sample in completed] == list(range(8, 129, 8))
-    assert all(sample.num_reqs == 1 and sample.full_cudagraph for sample in completed)
-    assert all(
-        sample.forward_ms >= 0 and sample.drafter_ms >= 0 for sample in completed
-    )
+    assert len(polled) == 1 and len(polled[0]) == 1
+    assert polled[0][0].num_target_tokens == 8
+    assert polled[0][0].num_reqs == 1
     assert collector.collect_ready() == []
 
-    for _ in range(8):
-        collector.start(num_target_tokens=8, num_reqs=1)
-    collector.cancel()
-    collector.forward_end()
-    collector.drafter_start()
-    collector.drafter_end()
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+def test_runtime_timing_invalidation_keeps_old_dependencies_and_new_samples():
+    """Session changes discard old data without releasing unfinished slots."""
+    collector = RuntimeTimingCollector()
+    flag = torch.ones((), dtype=torch.int32, device="cuda")
+    _wait_for_runtime_timing_release[(1,)](flag, num_warps=1)
     torch.accelerator.synchronize()
-    assert collector.collect_ready() == []
+    flag.zero_()
+    initialized = torch.cuda.Event()
+    initialized.record()
+    copy_stream = torch.cuda.Stream()
+    release_stream = torch.cuda.Stream()
+    copy_stream.wait_event(initialized)
+    release_stream.wait_event(initialized)
+    copy_done = torch.cuda.Event()
+    returned = Event()
+    polled: list[list[RuntimeTimingSample]] = []
+    errors: list[Exception] = []
+
+    def wait_for_second(end):
+        try:
+            for marker in end:
+                marker.synchronize()
+            polled.append(collector.collect_ready())
+        except Exception as error:
+            errors.append(error)
+        finally:
+            returned.set()
+
+    thread = None
+    try:
+        collector.start(num_target_tokens=8, num_reqs=1)
+        collector.forward_end()
+        collector.sampler_start()
+        with torch.cuda.stream(copy_stream):
+            _wait_for_runtime_timing_release[(1,)](flag, num_warps=1)
+            copy_done.record()
+        copy_marker = collector.record_copy_end(copy_stream)
+        assert copy_marker is not None
+        first_end = collector.sampler_end(copy_event=copy_marker)
+        collector.invalidate()
+        collector.start(num_target_tokens=16, num_reqs=1)
+        collector.forward_end()
+        collector.sampler_start()
+        second_end = collector.sampler_end()
+        assert first_end is not None and second_end is not None
+        thread = Thread(target=wait_for_second, args=(second_end,), daemon=True)
+        thread.start()
+        returned_before_release = returned.wait(timeout=5)
+        first_still_pending = any(not marker.query() for marker in first_end)
+    finally:
+        with torch.cuda.stream(release_stream):
+            flag.fill_(1)
+        release_stream.synchronize()
+        copy_stream.synchronize()
+        torch.accelerator.synchronize()
+        if thread is not None:
+            thread.join(timeout=5)
+
+    assert returned_before_release, "second step waited for the first step's copy"
+    assert first_still_pending, "first step completed without its copy dependency"
+    assert not errors
+    assert polled == [[]], "invalidation released the unfinished old queue entry"
+    assert [sample.num_target_tokens for sample in collector.collect_ready()] == [16]

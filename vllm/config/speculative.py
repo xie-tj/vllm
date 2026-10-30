@@ -618,7 +618,8 @@ class SpeculativeConfig:
     """Update adaptive verification costs from completed runtime measurements.
     Requires enable_adaptive_verification. TP ranks share the leader's decisions;
     dense DP replicas calibrate independently.
-    Disabled by default; startup-profiled costs remain the fallback."""
+    Disabled by default. FULL decode uses forward and runtime sampler estimates;
+    unsupported paths retain the startup-profiled costs."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:

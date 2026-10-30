@@ -1212,6 +1212,17 @@ class Worker(WorkerBase):
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
 
+    def _refresh_runtime_profiling_state(self) -> None:
+        if not self.use_v2_model_runner:
+            return
+        runner = cast("GPUModelRunnerV2", self.model_runner)
+        profiling_active = self.profiler is not None and self.profiler.is_running
+        if runner.runtime_profiling_active == profiling_active:
+            return
+        runner.runtime_profiling_active = profiling_active
+        if runner.runtime_timing is not None:
+            runner.runtime_timing.invalidate()
+
     def annotate_profile(self, scheduler_output):
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.
@@ -1360,10 +1371,7 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
-            if self.use_v2_model_runner:
-                cast("GPUModelRunnerV2", self.model_runner).runtime_profiling_active = (
-                    self.profiler is not None and self.profiler.is_running
-                )
+            self._refresh_runtime_profiling_state()
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
@@ -1461,6 +1469,8 @@ class Worker(WorkerBase):
                     # Proton output names are fixed when the wrapper is constructed.
                     # Recreate it so the next profile_prefix is honored.
                     self.profiler = None
+
+        self._refresh_runtime_profiling_state()
 
     @property
     def randomize_dummy_inputs(self) -> bool:

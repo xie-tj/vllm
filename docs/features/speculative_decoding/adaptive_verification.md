@@ -81,9 +81,17 @@ configuration, enable it with:
 }
 ```
 
-The feedback uses a DeepInfer-inspired robust estimator: it adds a non-negative
-forward-cost correction per physical token to the startup forward curve, then
-adds a runtime sampler estimate. It changes costs for the existing per-request
+The feedback uses a DeepInfer-style robust estimator. Its captured forward
+curve uses five startup measurements per physical token size, discards the
+minimum and maximum, and averages the remaining three. The raw curve is not
+made monotonic: candidates use the next captured size's original cost, even
+when a larger graph measured faster. Runtime residuals use this same raw
+baseline. Feedback-disabled and unsupported paths retain vLLM's existing
+median-based, monotonic startup tables.
+
+Online feedback adds a non-negative correction per physical token to that raw
+forward curve, then adds a runtime sampler estimate. It changes costs for the
+existing per-request
 verification budget, rather than introducing a separate batch-level draft-length
 policy.
 
@@ -108,9 +116,12 @@ sparse or unseen bucket falls back to the median of the latest nine samples
 across request counts, also requiring five samples. Before that, the estimate is
 zero: FULL-graph costs do not fall back to the startup draft curve. Eager,
 prefill and feedback-disabled paths retain the existing startup costs.
-If any candidate verification budget exceeds the CUDA-graph capture limit, the
-entire budget decision uses the old costs. This avoids comparing the new
-full-sampler cost with the old eager-path cost within one decision.
+For pure decode, if the minimum non-draft token count fits a captured graph,
+online feedback considers only verification budgets up to the capture limit.
+Larger eager-path candidates are excluded instead of mixing their old costs with
+the new full-sampler costs. If even the minimum token count exceeds that limit,
+or the batch includes prefill, the entire decision retains the existing startup
+costs.
 
 Forward corrections use at most 5,000 completed samples. Each physical-token-size
 bucket needs ten samples before its median per-token residual contributes to the

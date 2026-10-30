@@ -366,10 +366,17 @@ class OnlineCostModel:
         draft_cost: np.ndarray,
         verify_cost: np.ndarray,
         graph_sizes: list[int],
+        *,
+        forward_curve: list[tuple[int, float]] | None = None,
     ):
         self.draft_cost = draft_cost
         self.verify_cost = verify_cost
         self.graph_sizes = np.asarray(graph_sizes)
+        if forward_curve is None:
+            self._forward_cost = verify_cost[self.graph_sizes].copy()
+        else:
+            sizes, costs = np.asarray(forward_curve, dtype=np.float64).T
+            self._forward_cost = costs[np.searchsorted(sizes, self.graph_sizes)]
         self._valid_graph_sizes = set(graph_sizes)
         self._forward_samples: deque[tuple[int, float]] = deque()
         self._forward_by_size: dict[int, _MedianTracker] = defaultdict(_MedianTracker)
@@ -408,7 +415,8 @@ class OnlineCostModel:
                 or min(sample.forward_ms, sample.sampler_ms) <= 0
             ):
                 continue
-            residual = float((sample.forward_ms - self.verify_cost[size]) / size)
+            baseline = self._forward_cost[np.searchsorted(self.graph_sizes, size)]
+            residual = float((sample.forward_ms - baseline) / size)
             if not np.isfinite(residual):
                 continue
             if len(self._forward_samples) == 5000:
@@ -439,9 +447,10 @@ class OnlineCostModel:
     def get_costs(self, num_reqs: int, num_tokens: np.ndarray) -> np.ndarray:
         costs = self.draft_cost[num_reqs] + self.verify_cost[num_tokens]
         full = num_tokens <= self.graph_sizes[-1]
-        padded = self.graph_sizes[np.searchsorted(self.graph_sizes, num_tokens[full])]
+        indices = np.searchsorted(self.graph_sizes, num_tokens[full])
+        padded = self.graph_sizes[indices]
         costs[full] = (
-            self.verify_cost[num_tokens[full]]
+            self._forward_cost[indices]
             + self._slope * padded
             + self._sampler_ms(num_reqs)
         )
@@ -577,15 +586,32 @@ class AdaptiveVerificationManager:
         verify_curve = median_curve(
             (s.num_target_tokens, s.forward_ms) for s in samples
         )
-        self.set_cost_curves(draft_curve, verify_curve)
+        online_forward_curve = None
+        if self.runtime_timing is not None:
+            grouped: defaultdict[int, list[float]] = defaultdict(list)
+            for sample in samples:
+                if sample.full_cudagraph:
+                    grouped[sample.num_target_tokens].append(sample.forward_ms)
+            online_forward_curve = []
+            for size, values in sorted(grouped.items()):
+                assert len(values) == _PROFILE_REPLAYS
+                trimmed = sorted(values)[1:-1]
+                online_forward_curve.append((size, sum(trimmed) / len(trimmed)))
+        self.set_cost_curves(
+            draft_curve, verify_curve, online_forward_curve=online_forward_curve
+        )
 
     def set_cost_curves(
         self,
         draft_curve: list[tuple[int, float]],
         verify_curve: list[tuple[int, float]],
+        *,
+        online_forward_curve: list[tuple[int, float]] | None = None,
     ) -> None:
-        draft_curve, verify_curve = get_tp_group().broadcast_object(
-            (draft_curve, verify_curve), src=0
+        draft_curve, verify_curve, online_forward_curve = (
+            get_tp_group().broadcast_object(
+                (draft_curve, verify_curve, online_forward_curve), src=0
+            )
         )
         if not draft_curve or not verify_curve:
             raise RuntimeError(
@@ -604,6 +630,7 @@ class AdaptiveVerificationManager:
             self.online_cost_model = OnlineCostModel(
                 *self.cost_tables,
                 [size for size, _ in verify_curve if size <= self._cudagraph_limit],
+                forward_curve=online_forward_curve,
             )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
 
@@ -677,6 +704,15 @@ class AdaptiveVerificationManager:
             int(scheduled_drafts.sum()),
             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
         )
+        use_online = (
+            self.online_cost_model is not None
+            and not has_prefill
+            and num_non_draft_tokens_total <= self._cudagraph_limit
+        )
+        if use_online:
+            max_draft_budget = min(
+                max_draft_budget, self._cudagraph_limit - num_non_draft_tokens_total
+            )
         scores = scores[:max_draft_budget]
         draft_cost_ms, verify_cost_ms = self.cost_tables
         num_sampling_requests = np.count_nonzero(
@@ -694,11 +730,8 @@ class AdaptiveVerificationManager:
                 + 1
             ]
         )
-        if (
-            self.online_cost_model is not None
-            and not has_prefill
-            and num_non_draft_tokens_total + max_draft_budget <= self._cudagraph_limit
-        ):
+        if use_online:
+            assert self.online_cost_model is not None
             costs = self.online_cost_model.get_costs(
                 num_reqs,
                 np.arange(

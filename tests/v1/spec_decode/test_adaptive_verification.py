@@ -220,11 +220,14 @@ def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
     manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)
     manager.num_speculative_steps = 7
     manager.num_bonus_tokens = 1
+    manager.runtime_timing = None
     curves: dict[str, list[tuple[int, float]]] = {}
     monkeypatch.setattr(
         manager,
         "set_cost_curves",
-        lambda draft, verify: curves.update(draft=draft, verify=verify),
+        lambda draft, verify, online_forward_curve=None: curves.update(
+            draft=draft, verify=verify
+        ),
     )
 
     timings = [
@@ -252,6 +255,42 @@ def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
     # count they would land inside the captured range and, once made monotonic,
     # smear that eager cost across every larger request count.
     assert curves["draft"] == [(1, 1.0), (128, 1.0)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+def test_online_profile_uses_trimmed_raw_forward_costs_without_changing_fallback(
+    dist_init,
+):
+    device = torch.device("cuda")
+    states = RequestState(2, 32, 16, 3, 32, device)
+    buffers = InputBuffers(2, 16, device)
+    manager = AdaptiveVerificationManager(
+        states, buffers.query_start_loc, 1, 32, enable_online_cost_feedback=True
+    )
+    list(manager.batches_to_profile([4, 8]))
+    samples = [
+        StepTimingSample(value, 1.0, size, reqs, full)
+        for size, reqs, full, values in [
+            (4, 1, True, [1.0, 2.0, 3.0, 9.0, 100.0]),
+            (8, 2, True, [1.0, 1.5, 2.0, 2.5, 3.0]),
+            (16, 2, False, [9.0] * 5),
+        ]
+        for value in values
+    ]
+    manager.set_initial_cost_curves(samples)
+    assert manager.cost_tables is not None
+    np.testing.assert_array_equal(manager.cost_tables[1][[4, 8, 16]], [3, 3, 9])
+    model = manager.online_cost_model
+    assert model is not None
+    candidates = np.array([1, 4, 5, 8, 9])
+    np.testing.assert_array_equal(
+        model.get_costs(1, candidates), [14 / 3, 14 / 3, 2, 2, 10]
+    )
+    # Residuals are measured against raw 2ms, not the monotonic fallback's 3ms.
+    model.update([RuntimeTimingSample(4.0, 1.0, 8, 2)] * 10)
+    np.testing.assert_array_equal(
+        model.get_costs(1, candidates), [20 / 3, 20 / 3, 5, 5, 10]
+    )
 
 
 def test_compact_batch_preserves_totals_and_bounds():
@@ -489,7 +528,7 @@ def test_online_cost_feedback_ignores_an_invalid_timing_entirely(
 
 def _reference_online_costs(history, num_reqs, candidates):
     """Recompute from complete histories, without incremental median state."""
-    forward = {}
+    forward: dict[int, list[float]] = {}
     for sample in history[-5000:]:
         size = sample.num_target_tokens
         forward.setdefault(size, []).append((sample.forward_ms - size) / size)
@@ -673,13 +712,13 @@ def _online_tp_dp_worker(rank: int, tp_size: int, store: str, feedback=True) -> 
             )
             assert calibrated_total == (2 if feedback else 3)
 
-            # A decision spanning FULL and eager must keep the same startup
-            # cost basis. Mixing a learned FULL slope with the old eager price
-            # would choose only two tokens in this example instead of three.
+            # Online decode excludes eager candidates even when their old cost
+            # would beat all corrected FULL candidates. Static mode still sees
+            # all four candidates and admits both drafts.
             list(manager.batches_to_profile([1, 2, 3]))
             manager.set_cost_curves(
                 [(1, 1.0), (2, 1.0)],
-                [(1, 1.0), (2, 1.0), (3, 1.0), (4, 100.0)],
+                [(1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0)],
             )
             if manager.online_cost_model is not None:
                 manager.online_cost_model.update(
@@ -688,11 +727,35 @@ def _online_tp_dp_worker(rank: int, tp_size: int, store: str, feedback=True) -> 
             mixed_range_total = manager.get_num_tokens(
                 {"low": 2, "high": 2}, {"low": [0], "high": [0]}
             )
-            assert mixed_range_total == 3
+            assert mixed_range_total == (2 if feedback else 4)
+            prefill_total = manager.get_num_tokens(
+                {"low": 2, "high": 2}, {"low": [0], "high": [0]}, has_prefill=True
+            )
+            assert prefill_total == 4
+            list(manager.batches_to_profile([1]))
+            manager.set_cost_curves(
+                [(1, 1.0), (2, 1.0)],
+                [(1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0)],
+            )
+            if manager.online_cost_model is not None:
+                manager.online_cost_model.update(
+                    [RuntimeTimingSample(11.0, 1.0, 1, 2)] * 10
+                )
+            overflow_total = manager.get_num_tokens(
+                {"low": 2, "high": 2}, {"low": [0], "high": [0]}
+            )
+            assert overflow_total == 4
             layouts = [None] * 4
             dist.all_gather_object(
                 layouts,
-                (budget_layout, boundary_layout, calibrated_total, mixed_range_total),
+                (
+                    budget_layout,
+                    boundary_layout,
+                    calibrated_total,
+                    mixed_range_total,
+                    prefill_total,
+                    overflow_total,
+                ),
             )
             for start in range(0, 4, tp_size):
                 assert all(

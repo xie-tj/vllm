@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -111,6 +112,67 @@ class StepTimingCollector:
             self._step.drafter_end.record()
             self._timed.append((self._step, self._batch))
             self._step = None
+
+
+class RuntimeTimingCollector:
+    """Samples eligible FULL decode steps without waiting for pending CUDA work."""
+
+    _SAMPLE_INTERVAL = 8
+    _MAX_PENDING = 16
+
+    def __init__(self) -> None:
+        self._eligible_steps = 0
+        self._active: tuple[StepTimingEvents, int, int] | None = None
+        self._pending: deque[tuple[StepTimingEvents, int, int]] = deque()
+
+    def start(self, num_target_tokens: int, num_reqs: int) -> None:
+        """Start an eligible step using its actual padded token count."""
+        self.cancel()
+        self._eligible_steps += 1
+        if (
+            self._eligible_steps % self._SAMPLE_INTERVAL != 0
+            or len(self._pending) >= self._MAX_PENDING
+        ):
+            return
+        events = StepTimingEvents()
+        events.forward_start.record()
+        self._active = (events, num_target_tokens, num_reqs)
+
+    def forward_end(self) -> None:
+        if self._active is not None:
+            self._active[0].forward_end.record()
+
+    def drafter_start(self) -> None:
+        if self._active is not None:
+            self._active[0].drafter_start.record()
+
+    def drafter_end(self) -> None:
+        if self._active is not None:
+            self._active[0].drafter_end.record()
+            self._pending.append(self._active)
+            self._active = None
+
+    def collect_ready(self) -> list[StepTimingSample]:
+        """Drain the completed prefix without waiting for a CUDA event."""
+        samples: list[StepTimingSample] = []
+        while self._pending:
+            events, num_target_tokens, num_reqs = self._pending[0]
+            if not events.drafter_end.query():
+                break
+            self._pending.popleft()
+            samples.append(
+                StepTimingSample(
+                    forward_ms=events.forward_start.elapsed_time(events.forward_end),
+                    drafter_ms=events.drafter_start.elapsed_time(events.drafter_end),
+                    num_target_tokens=num_target_tokens,
+                    num_reqs=num_reqs,
+                    full_cudagraph=True,
+                )
+            )
+        return samples
+
+    def cancel(self) -> None:
+        self._active = None
 
 
 class AsyncOutput(AsyncModelRunnerOutput):

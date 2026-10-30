@@ -1360,6 +1360,10 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
+            if self.use_v2_model_runner:
+                cast("GPUModelRunnerV2", self.model_runner).runtime_profiling_active = (
+                    self.profiler is not None and self.profiler.is_running
+                )
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )

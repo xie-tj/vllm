@@ -5,11 +5,13 @@ import pytest
 
 from tests.utils import single_gpu_only
 from vllm import SamplingParams
+from vllm.config import CompilationConfig, CUDAGraphMode
 from vllm.platforms import current_platform
 
 from ...utils import (
     assert_request_outputs_match,
     compute_acceptance_len,
+    get_spec_decode_metric_value,
     get_test_prompts,
 )
 from .._correctness import check_mtp_correctness
@@ -43,6 +45,66 @@ def test_mtp_correctness(
         expected_accuracy_threshold,
         vllm_runner,
     )
+
+
+@pytest.mark.parametrize("online_cost_feedback", [False, True])
+@single_gpu_only
+def test_online_cost_feedback_preserves_constrained_mtp_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_runner,
+    enable_pickle,
+    online_cost_feedback: bool,
+):
+    """Runtime timing and adaptive budgets must preserve constrained outputs."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "64")
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=384,
+        ignore_eos=True,
+        allowed_token_ids=[42],
+    )
+    with vllm_runner(
+        "Qwen/Qwen3.5-0.8B-Base",
+        max_model_len=512,
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        enable_prefix_caching=False,
+        limit_mm_per_prompt={"image": 0, "video": 0},
+        attention_backend="TRITON_ATTN",
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            cudagraph_capture_sizes=[1, 4, 8],
+        ),
+        speculative_config={
+            "method": "mtp",
+            "num_speculative_tokens": 3,
+            "enable_adaptive_verification": True,
+            "enable_online_cost_feedback": online_cost_feedback,
+            "use_local_argmax_reduction": False,
+        },
+        disable_log_stats=False,
+    ) as runner:
+        outputs = runner.llm.generate(["The capital of France is"], params)
+        assert len(outputs) == 1
+        assert list(outputs[0].outputs[0].token_ids) == [42] * 384
+        assert (
+            get_spec_decode_metric_value(
+                runner.llm.get_metrics(), "vllm:spec_decode_num_drafts"
+            )
+            > 0
+        )
+
+        def num_cost_samples(worker):
+            model = worker.model_runner.adaptive_verification.online_cost_model
+            return None if model is None else model.num_samples
+
+        observed_samples = runner.llm.collective_rpc(num_cost_samples)
+        if online_cost_feedback:
+            assert len(observed_samples) == 1
+            assert observed_samples[0] >= 10
+        else:
+            assert observed_samples == [None]
 
 
 @single_gpu_only

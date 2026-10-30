@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
 
@@ -18,7 +18,11 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu.async_utils import StepTimingSample, stream
+from vllm.v1.worker.gpu.async_utils import (
+    RuntimeTimingCollector,
+    StepTimingSample,
+    stream,
+)
 from vllm.v1.worker.gpu.attn_utils import (
     get_query_lens_mismatch_unsupported_backend,
     get_varlen_cudagraph_unsupported_backend,
@@ -224,6 +228,74 @@ class AdmittedDraftCounts:
         return self._cpu.numpy()
 
 
+class OnlineCostModel:
+    """Calibrate full-graph decode costs while retaining the startup fallback."""
+
+    def __init__(
+        self,
+        draft_cost: np.ndarray,
+        verify_cost: np.ndarray,
+        graph_sizes: list[int],
+    ):
+        self.draft_cost = draft_cost
+        self.verify_cost = verify_cost
+        self.graph_sizes = np.asarray(graph_sizes)
+        self._forward_samples: deque[tuple[int, float]] = deque(maxlen=5000)
+        self._draft_samples: dict[int, deque[float]] = defaultdict(
+            lambda: deque(maxlen=9)
+        )
+        self._slope = 0.0
+        self._draft_ms: dict[int, float] = {}
+
+    @property
+    def num_samples(self) -> int:
+        return len(self._forward_samples)
+
+    def update(self, samples: list[StepTimingSample]) -> None:
+        for sample in samples:
+            size, reqs = sample.num_target_tokens, sample.num_reqs
+            if (
+                not sample.full_cudagraph
+                or size not in self.graph_sizes
+                or not 0 < reqs < len(self.draft_cost)
+                or not np.isfinite([sample.forward_ms, sample.drafter_ms]).all()
+                or min(sample.forward_ms, sample.drafter_ms) <= 0
+            ):
+                continue
+            residual = (sample.forward_ms - self.verify_cost[size]) / size
+            self._forward_samples.append((size, residual))
+            values = self._draft_samples[reqs]
+            values.append(sample.drafter_ms)
+            if len(values) >= 5:
+                self._draft_ms[reqs] = float(np.median(values))
+
+        grouped: dict[int, list[float]] = defaultdict(list)
+        for size, residual in self._forward_samples:
+            grouped[size].append(residual)
+        medians = [
+            np.median(values) for values in grouped.values() if len(values) >= 10
+        ]
+        self._slope = max(0.0, float(np.median(medians))) if medians else 0.0
+        if medians:
+            logger.info_once("Online adaptive verification cost feedback calibrated.")
+        logger.debug(
+            "Online AV costs: samples=%d, forward_slope_ms=%g, draft_ms=%s",
+            len(self._forward_samples),
+            self._slope,
+            self._draft_ms,
+        )
+
+    def get_costs(self, num_reqs: int, num_tokens: np.ndarray) -> np.ndarray:
+        costs = self.draft_cost[num_reqs] + self.verify_cost[num_tokens]
+        full = num_tokens <= self.graph_sizes[-1]
+        padded = self.graph_sizes[np.searchsorted(self.graph_sizes, num_tokens[full])]
+        costs[full] += self._slope * padded + (
+            self._draft_ms.get(num_reqs, self.draft_cost[num_reqs])
+            - self.draft_cost[num_reqs]
+        )
+        return np.maximum(costs, 1e-6)
+
+
 class AdaptiveVerificationManager:
     def __init__(
         self,
@@ -232,6 +304,7 @@ class AdaptiveVerificationManager:
         num_bonus_tokens: int,
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
+        enable_online_cost_feedback: bool = False,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -245,6 +318,10 @@ class AdaptiveVerificationManager:
         self._max_total_logits = max_total_logits
         self.query_start_loc = query_start_loc
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
+        self.runtime_timing = (
+            RuntimeTimingCollector() if enable_online_cost_feedback else None
+        )
+        self.online_cost_model: OnlineCostModel | None = None
         # Largest cudagraph-captured token count; above it nothing pads.
         self._cudagraph_limit = 0
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
@@ -368,6 +445,11 @@ class AdaptiveVerificationManager:
             self.req_states.max_num_batched_tokens,
             self._cudagraph_limit,
         )
+        if self.runtime_timing is not None:
+            self.online_cost_model = OnlineCostModel(
+                *self.cost_tables,
+                [size for size, _ in verify_curve if size <= self._cudagraph_limit],
+            )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
 
     def record_confidences(
@@ -400,6 +482,8 @@ class AdaptiveVerificationManager:
         self,
         num_tokens_per_req: dict[str, int],
         draft_tokens: dict[str, list[int]],
+        *,
+        has_prefill: bool = False,
     ) -> int:
         """Token count once the draft budget is trimmed to fit.
 
@@ -450,6 +534,14 @@ class AdaptiveVerificationManager:
                 + 1
             ]
         )
+        if self.online_cost_model is not None and not has_prefill:
+            costs = self.online_cost_model.get_costs(
+                num_reqs,
+                np.arange(
+                    num_non_draft_tokens_total,
+                    num_non_draft_tokens_total + max_draft_budget + 1,
+                ),
+            )
         num_drafts_per_req = {
             req_id: int(num_drafts)
             for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
@@ -595,8 +687,30 @@ def maybe_create_adaptive_verification_manager(
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
     copy_admitted_drafts_to_host: bool = False,
 ) -> AdaptiveVerificationManager | None:
+    online = bool(
+        vllm_config.speculative_config
+        and vllm_config.speculative_config.enable_online_cost_feedback
+    )
     if not enable_adaptive_verification:
+        if online:
+            raise ValueError(
+                "Online cost feedback requires active adaptive verification."
+            )
         return None
+
+    parallel = vllm_config.parallel_config
+    if online and (
+        parallel.tensor_parallel_size != 1
+        or parallel.data_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        or parallel.enable_expert_parallel
+        or parallel.use_ubatching
+    ):
+        raise ValueError(
+            "Online cost feedback currently requires TP=DP=PCP=DCP=1 "
+            "without expert parallelism or microbatching."
+        )
 
     # The selector rejects unsupported backends, but models that
     # hard-wire theirs (e.g. DeepSeek-V4) never go through it.
@@ -643,4 +757,5 @@ def maybe_create_adaptive_verification_manager(
         num_bonus_tokens,
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
+        enable_online_cost_feedback=online,
     )

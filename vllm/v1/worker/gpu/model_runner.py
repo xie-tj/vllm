@@ -95,6 +95,7 @@ from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
     AsyncPoolingOutput,
+    RuntimeTimingCollector,
     StepTimingCollector,
 )
 from vllm.v1.worker.gpu.attn_utils import (
@@ -322,6 +323,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner: PoolingRunner | None = None
 
         self.step_timing = StepTimingCollector()
+        self.runtime_timing: RuntimeTimingCollector | None = None
+        self.runtime_profiling_active = False
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -729,6 +732,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             additional_attn_cg_support=additional_attn_cg_support,
             copy_admitted_drafts_to_host=self.batch_sharder is not None,
         )
+        if self.adaptive_verification is not None:
+            self.runtime_timing = self.adaptive_verification.runtime_timing
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -1376,7 +1381,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.adaptive_verification is not None:
                 num_toks = self.adaptive_verification.get_num_tokens(
-                    num_tokens_per_req, draft_tokens
+                    num_tokens_per_req, draft_tokens, has_prefill=has_prefill
                 )
 
         prefill_runs_as_decode_np = None
@@ -1791,6 +1796,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if self.runtime_timing is not None and not dummy_run:
+            self.runtime_timing.cancel()
+            samples = self.runtime_timing.collect_ready()
+            if samples and not self.runtime_profiling_active:
+                assert self.adaptive_verification is not None
+                assert self.adaptive_verification.online_cost_model is not None
+                self.adaptive_verification.online_cost_model.update(samples)
         if not dummy_run:
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
@@ -2068,6 +2080,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
+        if (
+            self.runtime_timing is not None
+            and not dummy_run
+            and not is_profile
+            and not self.runtime_profiling_active
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and not input_batch.is_prefilling_np.any()
+            and not scheduler_output.skip_drafts
+            and scheduler_output.num_spec_tokens_to_schedule
+            == self.num_speculative_steps
+        ):
+            self.runtime_timing.start(
+                input_batch.num_tokens_after_padding, input_batch.num_reqs
+            )
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -2119,6 +2145,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+
+        if self.runtime_timing is not None:
+            self.runtime_timing.forward_end()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2322,6 +2351,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = get_drafter_hidden_states(
                 self.model, draft_hidden_states
             )
+            if self.runtime_timing is not None:
+                self.runtime_timing.drafter_start()
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2339,6 +2370,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
+            if self.runtime_timing is not None:
+                self.runtime_timing.drafter_end()
             if self.pcp_manager is not None:
                 self.pcp_manager.sync_drafts(
                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits

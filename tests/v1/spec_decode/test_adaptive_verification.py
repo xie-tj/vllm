@@ -2,18 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import nullcontext
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
-from vllm.v1.worker.gpu.async_utils import StepTimingSample
+from vllm.v1.worker.gpu.async_utils import RuntimeTimingCollector, StepTimingSample
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    OnlineCostModel,
     assign_draft_token_budget,
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
@@ -34,6 +38,7 @@ def make_manager(
         prefill_len=SimpleNamespace(np=np.ones(num_reqs, dtype=np.int32)),
     )
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
+    manager.online_cost_model = None
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
     return manager
@@ -158,7 +163,7 @@ def test_manager_checks_target_varlen_cudagraph_bound(
             query_start_loc=object(),
             num_bonus_tokens=1,
             max_total_logits=1,
-            vllm_config=None,
+            vllm_config=VllmConfig(),
             target_layer_names={"target"},
             additional_attn_cg_support=additional,
         )
@@ -363,3 +368,168 @@ def test_draft_budget_kernel_admits_exact_budget_on_ties():
     survival = torch.empty(num_reqs * num_steps, dtype=torch.int32, device="cuda")
     assign_draft_token_budget(confidence_probs, idx_mapping, capacities, 800, survival)
     assert capacities.tolist() == [3] * 266 + [2] + [0] * 33
+
+
+def _online_cost_model() -> OnlineCostModel:
+    # Startup prices are flat inside captured shapes and unpadded above 16.
+    verify = np.array([0] + [4] * 4 + [8] * 4 + [16] * 8 + list(range(17, 33)))
+    return OnlineCostModel(np.array([0.0, 2.0, 4.0]), verify.astype(float), [4, 8, 16])
+
+
+def test_online_cost_feedback_waits_for_evidence_and_prices_padded_shapes():
+    model = _online_cost_model()
+    candidates = np.array([1, 4, 5, 8, 9, 16, 17])
+    initial = np.array([6, 6, 10, 10, 18, 18, 19])
+    samples = [StepTimingSample(16.0, 2.0, 8, 1, True)]
+
+    model.update(samples * 9)
+    assert model.num_samples == 9
+    np.testing.assert_array_equal(model.get_costs(1, candidates), initial)
+    model.update(samples)
+    assert model.num_samples == 10
+    np.testing.assert_array_equal(
+        model.get_costs(1, candidates), [10, 10, 18, 18, 34, 34, 19]
+    )
+    # A request-count bucket without observations retains its startup draft cost.
+    np.testing.assert_array_equal(model.get_costs(2, np.array([8, 17])), [20, 21])
+
+
+def test_online_draft_cost_uses_five_samples_then_a_nine_sample_median():
+    model = _online_cost_model()
+    candidates = np.array([4, 17])
+    high = StepTimingSample(4.0, 20.0, 4, 1, True)
+    model.update([high] * 4)
+    np.testing.assert_array_equal(model.get_costs(1, candidates), [6, 19])
+    model.update([high])
+    np.testing.assert_array_equal(model.get_costs(1, candidates), [24, 19])
+    model.update([high] * 4)
+    model.update([StepTimingSample(4.0, 2.0, 4, 1, True)] * 5)
+    np.testing.assert_array_equal(model.get_costs(1, candidates), [6, 19])
+
+
+def test_online_forward_cost_balances_shapes_and_forgets_old_observations():
+    model = _online_cost_model()
+    # Per-shape residual medians are 1, 3, and 6 ms/token. The hot shape must
+    # not dominate the median, and one high outlier must not dominate shape 4.
+    model.update(
+        [StepTimingSample(8.0, 2.0, 4, 1, True)] * 9
+        + [StepTimingSample(4000.0, 2.0, 4, 1, True)]
+        + [StepTimingSample(32.0, 2.0, 8, 1, True)] * 10
+        + [StepTimingSample(112.0, 2.0, 16, 1, True)] * 20
+    )
+    np.testing.assert_array_equal(
+        model.get_costs(1, np.array([1, 5, 9, 17])), [18, 34, 66, 19]
+    )
+    # A full new window evicts all old shapes. Faster forwards never create
+    # a negative correction to the startup price.
+    model.update([StepTimingSample(4.0, 2.0, 8, 1, True)] * 5000)
+    np.testing.assert_array_equal(
+        model.get_costs(1, np.array([1, 5, 9, 17])), [6, 10, 18, 19]
+    )
+
+
+@pytest.mark.parametrize(
+    ("forward_ms", "drafter_ms"),
+    [(float("nan"), 20.0), (16.0, float("inf")), (0.0, 20.0), (16.0, -1.0)],
+)
+def test_online_cost_feedback_ignores_an_invalid_timing_entirely(
+    forward_ms, drafter_ms
+):
+    model = _online_cost_model()
+    model.update([StepTimingSample(16.0, 20.0, 8, 1, True)] * 4)
+    model.update([StepTimingSample(forward_ms, drafter_ms, 8, 1, True)] * 10)
+    model.update([StepTimingSample(16.0, 20.0, 7, 1, True)] * 10)
+    model.update([StepTimingSample(16.0, 20.0, 8, 1, False)] * 10)
+    np.testing.assert_array_equal(model.get_costs(1, np.array([8, 17])), [10, 19])
+
+
+def test_online_cost_feedback_requires_adaptive_verification():
+    with pytest.raises(ValueError, match="requires enable_adaptive_verification=True"):
+        SpeculativeConfig(enable_online_cost_feedback=True)
+
+
+def test_online_cost_feedback_rejects_target_tensor_parallelism():
+    with pytest.raises(ValueError, match="requires target tensor_parallel_size=1"):
+        SpeculativeConfig(
+            enable_online_cost_feedback=True,
+            enable_adaptive_verification=True,
+            target_parallel_config=ParallelConfig(
+                tensor_parallel_size=2, distributed_executor_backend="mp"
+            ),
+        )
+
+
+@triton.jit
+def _wait_for_runtime_timing_release(flag):
+    while tl.atomic_add(flag, 0, sem="acquire") == 0:
+        pass
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+def test_runtime_timing_keeps_pending_events_without_waiting_or_overwriting():
+    collector = RuntimeTimingCollector()
+    flag = torch.ones((), dtype=torch.int32, device="cuda")
+    # Compile before holding the sampling stream: compilation may synchronize.
+    _wait_for_runtime_timing_release[(1,)](flag, num_warps=1)
+    torch.accelerator.synchronize()
+    flag.zero_()
+    initialized = torch.cuda.Event()
+    initialized.record()
+    sampling_stream = torch.cuda.Stream()
+    release_stream = torch.cuda.Stream()
+    sampling_stream.wait_event(initialized)
+    release_stream.wait_event(initialized)
+    queued = torch.cuda.Event()
+    returned = Event()
+    polled: list[list[StepTimingSample]] = []
+    errors: list[Exception] = []
+
+    def poll():
+        try:
+            polled.append(collector.collect_ready())
+        except Exception as error:
+            errors.append(error)
+        finally:
+            returned.set()
+
+    thread = Thread(target=poll, daemon=True)
+    try:
+        with torch.cuda.stream(sampling_stream):
+            _wait_for_runtime_timing_release[(1,)](flag, num_warps=1)
+            for sample in range(1, 18):
+                for _ in range(8):
+                    collector.start(num_target_tokens=sample * 8, num_reqs=1)
+                    collector.forward_end()
+                    collector.drafter_start()
+                    collector.drafter_end()
+            queued.record()
+        assert not queued.query()
+        thread.start()
+        returned_before_release = returned.wait(timeout=5)
+    finally:
+        with torch.cuda.stream(release_stream):
+            flag.fill_(1)
+        release_stream.synchronize()
+        sampling_stream.synchronize()
+        if thread.ident is not None:
+            thread.join(timeout=5)
+
+    assert returned_before_release, "collect_ready blocked on unfinished GPU work"
+    assert not errors
+    assert polled == [[]]
+    completed = collector.collect_ready()
+    assert [sample.num_target_tokens for sample in completed] == list(range(8, 129, 8))
+    assert all(sample.num_reqs == 1 and sample.full_cudagraph for sample in completed)
+    assert all(
+        sample.forward_ms >= 0 and sample.drafter_ms >= 0 for sample in completed
+    )
+    assert collector.collect_ready() == []
+
+    for _ in range(8):
+        collector.start(num_target_tokens=8, num_reqs=1)
+    collector.cancel()
+    collector.forward_end()
+    collector.drafter_start()
+    collector.drafter_end()
+    torch.accelerator.synchronize()
+    assert collector.collect_ready() == []

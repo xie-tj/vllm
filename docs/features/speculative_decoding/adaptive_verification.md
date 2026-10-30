@@ -64,3 +64,38 @@ Step costs are profiled against a synthetic KV context, 8192 tokens by default. 
 ```bash
 export VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN=131072
 ```
+
+### Online cost feedback
+
+`enable_online_cost_feedback` updates the cost estimate from completed serving
+steps as workload costs drift from the startup profile. It is disabled by
+default and requires `enable_adaptive_verification: true`. For an existing MTP
+configuration, enable it with:
+
+```json
+{
+  "method": "mtp",
+  "num_speculative_tokens": 3,
+  "enable_adaptive_verification": true,
+  "enable_online_cost_feedback": true
+}
+```
+
+The feedback uses a DeepInfer-inspired robust estimator with vLLM's existing
+forward and draft boundaries: it fits a non-negative forward-cost slope and
+uses median draft costs by request count.
+It changes cost estimates for the existing per-request verification budget;
+it does not introduce a separate batch-level draft-length policy. Startup-profiled
+costs remain the fallback until enough valid measurements are available.
+
+The first version supports a single target GPU: target TP=1, DP=1, PCP=DCP=1,
+with expert parallelism and dual-batch overlap disabled. It learns only from
+pure decode steps using FULL CUDA graphs; prefill and unsupported execution
+shapes retain startup costs. Existing adaptive-verification restrictions on
+attention backends, LoRA and pipeline parallelism still apply.
+
+Timing events are recorded around real forward and draft execution. Completed
+measurements are collected later with non-blocking event queries, so feedback
+does not wait for a running draft to finish. Async scheduling remains supported.
+vLLM-managed profiler sessions are excluded from feedback: their timing overhead
+must not become the serving cost estimate.

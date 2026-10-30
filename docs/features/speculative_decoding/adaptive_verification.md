@@ -139,8 +139,33 @@ Budget and layout consensus also applies when cost feedback is disabled.
 
 Dense data-parallel replicas learn independently within their own TP groups.
 For example, `--tensor-parallel-size 2 --data-parallel-size 4` uses eight GPUs
-with four independent cost models. MoE DP, expert parallelism, context
-parallelism and dual-batch overlap are currently unsupported by online feedback.
+with four independent cost models.
+
+MoE data parallelism and expert parallelism use one cost model for the TP×DP
+expert execution group. Each DP replica contributes its expected accepted tokens;
+the group driver chooses the complete vector of replica budgets against their
+common physical graph size, including padding imposed by idle replicas. Its
+objective is total expected acceptance divided by the cooperating forward cost
+plus the largest predicted replica sampler cost. Request counts remain local to
+each replica's sampler; they are not summed into a fictitious global sampler.
+Only the group driver records runtime observations. Startup forward curves use
+the group mean of rank-local trimmed measurements, with valid dummy tokens and
+randomized token inputs routed through the normal MoE router.
+
+All ranks, including idle ranks, participate in each decision in the same order.
+Decisions and observations carry a step, cost version, profiler epoch, replica
+request counts and physical shapes. If any rank is profiling or a replica has
+prefill, the entire group falls back to startup costs. The driver does not learn
+from dummy sampler work. The existing estimator approximates other replicas'
+sampler costs using observations from the same driver and the same 9/5 fallback.
+Worker `get_online_cost_feedback_stats` collective RPC returns bounded observation
+and admitted-budget diagnostics for verification and performance analysis.
+
+MoE EP feedback currently requires static groups and the
+`allgather_reducescatter` backend. Context parallelism, elastic EP, other expert
+communication backends and dual-batch overlap remain unsupported by online feedback.
+Batch-size-dependent draft-step schedules are also unsupported for MoE feedback;
+the proposal step count must stay fixed across cooperating replicas.
 It learns only from real pure-decode steps using FULL CUDA graphs; prefill,
 dummy steps and unsupported execution shapes retain startup costs. Existing
 adaptive-verification restrictions on attention backends, LoRA and pipeline

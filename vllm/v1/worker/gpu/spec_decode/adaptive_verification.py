@@ -12,7 +12,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -28,6 +28,10 @@ from vllm.v1.worker.gpu.async_utils import (
 from vllm.v1.worker.gpu.attn_utils import (
     get_query_lens_mismatch_unsupported_backend,
     get_varlen_cudagraph_unsupported_backend,
+)
+from vllm.v1.worker.gpu.spec_decode.parallel_cost import (
+    BudgetProposal,
+    ParallelCostCoordinator,
 )
 
 logger = init_logger(__name__)
@@ -404,7 +408,8 @@ class OnlineCostModel:
         elif not values:
             del self._forward_by_size[size]
 
-    def update(self, samples: list[RuntimeTimingSample]) -> None:
+    def update(self, samples: list[RuntimeTimingSample]) -> list[RuntimeTimingSample]:
+        accepted = []
         for sample in samples:
             size, reqs = sample.num_target_tokens, sample.num_reqs
             if (
@@ -426,6 +431,7 @@ class OnlineCostModel:
             self._update_forward(size, residual, insert=True)
             self._sampler_samples[reqs].append(sample.sampler_ms)
             self._sampler_fallback.append(sample.sampler_ms)
+            accepted.append(sample)
 
         self._slope = (
             max(0.0, self._forward_medians.median()) if self._forward_medians else 0.0
@@ -437,6 +443,7 @@ class OnlineCostModel:
             len(self._forward_samples),
             self._slope,
         )
+        return accepted
 
     def _sampler_ms(self, num_reqs: int) -> float:
         values = self._sampler_samples.get(num_reqs)
@@ -456,8 +463,21 @@ class OnlineCostModel:
         )
         return np.maximum(costs, 1e-6)
 
+    def get_parallel_costs(
+        self, num_reqs: list[int], physical_tokens: np.ndarray
+    ) -> np.ndarray:
+        """Price a cooperating forward and concurrent replica samplers."""
+        indices = np.searchsorted(self.graph_sizes, physical_tokens)
+        sampler_ms = max((self._sampler_ms(n) for n in num_reqs if n), default=0.0)
+        return np.maximum(
+            self._forward_cost[indices] + self._slope * physical_tokens + sampler_ms,
+            1e-6,
+        )
+
 
 class AdaptiveVerificationManager:
+    parallel_costs: ParallelCostCoordinator | None = None
+
     def __init__(
         self,
         req_states: "RequestState",
@@ -466,6 +486,7 @@ class AdaptiveVerificationManager:
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
         enable_online_cost_feedback: bool = False,
+        coordinate_moe_costs: bool = False,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -479,10 +500,20 @@ class AdaptiveVerificationManager:
         self._max_total_logits = max_total_logits
         self.query_start_loc = query_start_loc
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
+        self.parallel_costs = (
+            ParallelCostCoordinator(req_states.max_num_batched_tokens)
+            if coordinate_moe_costs
+            else None
+        )
         self.synchronize_tp_decisions = get_tp_group().world_size > 1
         self.runtime_timing = (
             RuntimeTimingCollector()
-            if enable_online_cost_feedback and get_tp_group().is_first_rank
+            if enable_online_cost_feedback
+            and (
+                self.parallel_costs.group.is_first_rank
+                if self.parallel_costs is not None
+                else get_tp_group().is_first_rank
+            )
             else None
         )
         self.online_cost_model: OnlineCostModel | None = None
@@ -562,9 +593,18 @@ class AdaptiveVerificationManager:
             tail_sizes -= set(capture_sizes)
         for num_tokens in capture_sizes + sorted(tail_sizes):
             for _ in range(_PROFILE_REPLAYS):
+                if self.parallel_costs is not None:
+                    with gpu_sync_allowed():
+                        torch.accelerator.synchronize()
+                    self.parallel_costs.group.barrier()
                 yield {
                     "num_tokens": num_tokens,
                     "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+                    **(
+                        {"randomize_inputs": True, "route_dummy_tokens": True}
+                        if self.parallel_costs is not None
+                        else {}
+                    ),
                 }
 
     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
@@ -587,7 +627,7 @@ class AdaptiveVerificationManager:
             (s.num_target_tokens, s.forward_ms) for s in samples
         )
         online_forward_curve = None
-        if self.runtime_timing is not None:
+        if self.runtime_timing is not None or self.parallel_costs is not None:
             grouped: defaultdict[int, list[float]] = defaultdict(list)
             for sample in samples:
                 if sample.full_cudagraph:
@@ -608,11 +648,31 @@ class AdaptiveVerificationManager:
         *,
         online_forward_curve: list[tuple[int, float]] | None = None,
     ) -> None:
-        draft_curve, verify_curve, online_forward_curve = (
-            get_tp_group().broadcast_object(
-                (draft_curve, verify_curve, online_forward_curve), src=0
+        if self.parallel_costs is not None:
+            group = self.parallel_costs.group
+            curves = (draft_curve, verify_curve, online_forward_curve or [])
+            keys = tuple(tuple(k for k, _ in curve) for curve in curves)
+            common_keys = group.broadcast_object(keys, src=0)
+            values = (
+                [v for curve in curves for _, v in curve]
+                if keys == common_keys
+                else [0.0] * sum(map(len, common_keys))
             )
-        )
+            packed = torch.tensor(
+                values + [float(keys == common_keys)], dtype=torch.float64
+            )
+            group.cpu_all_reduce_(packed)
+            assert packed[-1] == group.world_size, "MoE profile shapes disagree"
+            averaged = iter((packed[:-1] / group.world_size).tolist())
+            draft_curve, verify_curve, online_forward_curve = (
+                [(k, next(averaged)) for k in sizes] for sizes in common_keys
+            )
+        else:
+            draft_curve, verify_curve, online_forward_curve = (
+                get_tp_group().broadcast_object(
+                    (draft_curve, verify_curve, online_forward_curve), src=0
+                )
+            )
         if not draft_curve or not verify_curve:
             raise RuntimeError(
                 "Adaptive verification could not profile step costs. Pass "
@@ -633,6 +693,77 @@ class AdaptiveVerificationManager:
                 forward_curve=online_forward_curve,
             )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
+
+    def coordinate_parallel_step(
+        self,
+        num_tokens_per_req: dict[str, int],
+        draft_tokens: dict[str, list[int]],
+        *,
+        has_prefill: bool,
+        dummy_run: bool,
+        profiling: bool,
+        skip_drafts: bool = False,
+    ) -> None:
+        """Join the group decision even when this replica only executes dummy work."""
+        if self.parallel_costs is None or self.cost_tables is None:
+            return
+        if dummy_run:
+            proposal = BudgetProposal(
+                0,
+                sum(num_tokens_per_req.values()),
+                np.zeros(1),
+            )
+        else:
+            req_ids = list(num_tokens_per_req)
+            slots = [self.req_states.req_id_to_index[r] for r in req_ids]
+            drafts = np.array([len(draft_tokens.get(r, ())) for r in req_ids])
+            base = sum(num_tokens_per_req.values()) - int(drafts.sum())
+            capacity = max(
+                0,
+                min(
+                    int(drafts.sum()),
+                    self._cudagraph_limit - base,
+                    self._max_total_logits - len(req_ids) * self.num_bonus_tokens,
+                ),
+            )
+            stale = self._stale_confidences[self._stale_idx].np[slots]
+            survival = np.cumprod(stale.astype(np.float64), axis=1)
+            valid = np.arange(self.num_speculative_steps)[None, :] < drafts[:, None]
+            scores = np.sort(survival[valid])[::-1][:capacity]
+            proposal = BudgetProposal(
+                len(req_ids),
+                base,
+                np.concatenate(([len(req_ids)], len(req_ids) + np.cumsum(scores))),
+                not has_prefill and base <= self._cudagraph_limit and not skip_drafts,
+            )
+        self.parallel_costs.coordinate(
+            proposal, self.online_cost_model, self.runtime_timing, profiling=profiling
+        )
+
+    def start_runtime_timing(
+        self,
+        input_batch: "InputBatch",
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> None:
+        """Tag an eligible driver observation with the agreed physical batch."""
+        if self.runtime_timing is None:
+            return
+        context = None
+        if self.parallel_costs is not None:
+            decision = self.parallel_costs.decision
+            if decision is None or decision.budgets is None:
+                return
+            context = decision.context
+            physical = (
+                (input_batch.num_tokens_after_padding,)
+                if num_tokens_across_dp is None
+                else tuple(int(n) for n in num_tokens_across_dp)
+            )
+            assert physical == context.num_tokens_across_dp, "MoE cost shape mismatch"
+            assert input_batch.num_reqs == context.num_reqs_across_dp[0]
+        self.runtime_timing.start(
+            input_batch.num_tokens_after_padding, input_batch.num_reqs, context=context
+        )
 
     def record_confidences(
         self, confidence_probs: torch.Tensor, input_batch: "InputBatch"
@@ -678,6 +809,14 @@ class AdaptiveVerificationManager:
         reallocation that follow in the same step.
         """
         assert self.cost_tables is not None
+        if self.parallel_costs is not None:
+            decision = self.parallel_costs.decision
+            if decision is not None and decision.budgets is not None:
+                drafts = {r: len(draft_tokens.get(r, ())) for r in num_tokens_per_req}
+                base = {r: n - drafts[r] for r, n in num_tokens_per_req.items()}
+                budget = decision.budgets[get_dp_group().rank_in_group]
+                self._batch_budget = drafts, base, budget
+                return sum(base.values()) + budget
         req_ids = list(num_tokens_per_req)
         num_reqs = len(req_ids)
         scheduled_tokens = np.fromiter(
@@ -706,6 +845,7 @@ class AdaptiveVerificationManager:
         )
         use_online = (
             self.online_cost_model is not None
+            and self.parallel_costs is None
             and not has_prefill
             and num_non_draft_tokens_total <= self._cudagraph_limit
         )
@@ -905,20 +1045,37 @@ def maybe_create_adaptive_verification_manager(
     if online and (
         parallel.prefill_context_parallel_size != 1
         or parallel.decode_context_parallel_size != 1
-        or parallel.enable_expert_parallel
         or parallel.use_ubatching
     ):
         raise ValueError(
-            "Online cost feedback currently requires PCP=DCP=1 "
-            "without expert parallelism or microbatching."
+            "Online cost feedback currently requires PCP=DCP=1 without microbatching."
         )
-    if (
+    coordinate_moe = bool(
         online
-        and parallel.data_parallel_size > 1
         and vllm_config.model_config is not None
         and vllm_config.model_config.is_moe
+        and (parallel.data_parallel_size > 1 or parallel.enable_expert_parallel)
+    )
+    if (
+        coordinate_moe
+        and vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.uses_dynamic_speculative_decoding()
     ):
-        raise ValueError("Online cost feedback currently supports dense DP replicas.")
+        raise ValueError(
+            "Online MoE cost feedback requires fixed draft-step counts; "
+            "batch-size-dependent draft schedules need group coordination."
+        )
+    if coordinate_moe and (
+        parallel.enable_elastic_ep
+        or (
+            parallel.enable_expert_parallel
+            and parallel.all2all_backend != "allgather_reducescatter"
+        )
+    ):
+        raise ValueError(
+            "Online MoE cost feedback requires static groups and the "
+            "allgather_reducescatter expert backend."
+        )
 
     # The selector rejects unsupported backends, but models that
     # hard-wire theirs (e.g. DeepSeek-V4) never go through it.
@@ -966,4 +1123,5 @@ def maybe_create_adaptive_verification_manager(
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
         enable_online_cost_feedback=online,
+        coordinate_moe_costs=coordinate_moe,
     )

@@ -1212,6 +1212,19 @@ class Worker(WorkerBase):
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
 
+    def get_online_cost_feedback_stats(self) -> dict | None:
+        """Return cost observations and the actual coordinated budget histogram."""
+        if not self.use_v2_model_runner:
+            return None
+        manager = cast("GPUModelRunnerV2", self.model_runner).adaptive_verification
+        if manager is None:
+            return None
+        model = manager.online_cost_model
+        stats = {"num_samples": None if model is None else model.num_samples}
+        if manager.parallel_costs is not None:
+            stats.update(manager.parallel_costs.diagnostics())
+        return stats
+
     def _refresh_runtime_profiling_state(self) -> None:
         if not self.use_v2_model_runner:
             return

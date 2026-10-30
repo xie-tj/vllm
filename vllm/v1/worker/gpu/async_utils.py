@@ -115,11 +115,25 @@ class StepTimingCollector:
 
 
 @dataclass(frozen=True)
+class RuntimeTimingContext:
+    step_id: int
+    epoch: int
+    cost_version: int
+    num_reqs_across_dp: tuple[int, ...]
+    num_tokens_across_dp: tuple[int, ...]
+    num_valid_tokens_across_dp: tuple[int, ...]
+    predicted_ms: float
+    group_ranks: tuple[int, ...] = ()
+    predicted_driver_ms: float = 0.0
+
+
+@dataclass(frozen=True)
 class RuntimeTimingSample:
     forward_ms: float
     sampler_ms: float
     num_target_tokens: int
     num_reqs: int
+    context: RuntimeTimingContext | None = None
 
 
 @dataclass
@@ -137,24 +151,33 @@ class RuntimeTimingCollector:
 
     def __init__(self) -> None:
         self._discard_pending = 0
-        self._active: tuple[_RuntimeTimingEvents, int, int] | None = None
+        self._active: (
+            tuple[_RuntimeTimingEvents, int, int, RuntimeTimingContext | None] | None
+        ) = None
         self._pending: deque[
             tuple[
                 _RuntimeTimingEvents,
                 int,
                 int,
                 tuple[torch.cuda.Event, ...],
+                RuntimeTimingContext | None,
             ]
         ] = deque()
 
-    def start(self, num_target_tokens: int, num_reqs: int) -> None:
+    def start(
+        self,
+        num_target_tokens: int,
+        num_reqs: int,
+        *,
+        context: RuntimeTimingContext | None = None,
+    ) -> None:
         """Start an eligible step using its actual padded token count."""
         self.cancel()
         if len(self._pending) >= self._MAX_PENDING:
             return
         events = _RuntimeTimingEvents()
         events.forward_start.record()
-        self._active = (events, num_target_tokens, num_reqs)
+        self._active = (events, num_target_tokens, num_reqs, context)
 
     def forward_end(self) -> None:
         if self._active is not None:
@@ -180,14 +203,14 @@ class RuntimeTimingCollector:
         *additional_events: torch.cuda.Event | None,
     ) -> tuple[torch.cuda.Event, ...] | None:
         if self._active is not None:
-            events, num_tokens, num_reqs = self._active
+            events, num_tokens, num_reqs, context = self._active
             events.sampler_end.record()
             dependencies = tuple(
                 event
                 for event in (events.sampler_end, copy_event, *additional_events)
                 if event is not None
             )
-            self._pending.append((events, num_tokens, num_reqs, dependencies))
+            self._pending.append((events, num_tokens, num_reqs, dependencies, context))
             self._active = None
             return dependencies
         return None
@@ -196,7 +219,9 @@ class RuntimeTimingCollector:
         """Drain the completed prefix without waiting for a CUDA event."""
         samples: list[RuntimeTimingSample] = []
         while self._pending:
-            events, num_target_tokens, num_reqs, completion_events = self._pending[0]
+            events, num_target_tokens, num_reqs, completion_events, context = (
+                self._pending[0]
+            )
             if not all(event.query() for event in completion_events):
                 break
             self._pending.popleft()
@@ -212,6 +237,7 @@ class RuntimeTimingCollector:
                     ),
                     num_target_tokens=num_target_tokens,
                     num_reqs=num_reqs,
+                    context=context,
                 )
             )
         return samples

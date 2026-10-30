@@ -174,18 +174,22 @@ class InputBatch:
         input_buffers.seq_lens[num_reqs - num_extra : num_reqs] = base_tokens + 1
         # Pad for full CUDA graph mode.
         input_buffers.seq_lens[num_reqs:] = 0
-        seq_lens = input_buffers.seq_lens[:num_reqs]
+        seq_lens = input_buffers.seq_lens[:num_reqs_after_padding]
 
-        query_start_loc_np = np.empty(num_reqs + 1, dtype=np.int32)
+        query_start_loc_np = np.full(
+            num_reqs_after_padding + 1, num_tokens, dtype=np.int32
+        )
         query_start_loc_np[0] = 0
-        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
+        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
         input_buffers.query_start_loc[:1] = 0
         torch.cumsum(
-            seq_lens, dim=0, out=input_buffers.query_start_loc[1 : num_reqs + 1]
+            seq_lens[:num_reqs],
+            dim=0,
+            out=input_buffers.query_start_loc[1 : num_reqs + 1],
         )
         # Pad for full CUDA graph mode.
         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
-        query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
+        query_start_loc = input_buffers.query_start_loc[: num_reqs_after_padding + 1]
 
         input_ids = input_buffers.input_ids[:num_tokens_after_padding].zero_()
         positions = input_buffers.positions[:num_tokens_after_padding].zero_()
@@ -194,12 +198,14 @@ class InputBatch:
         input_buffers.is_padding[num_tokens:num_tokens_after_padding] = True
         is_padding = input_buffers.is_padding[:num_tokens_after_padding]
 
-        logits_indices = query_start_loc[1:] - 1
+        logits_indices = query_start_loc[1 : num_reqs + 1] - 1
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
         # Copy so set_dummy_context can add context in place without touching
         # num_scheduled_tokens.
-        seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
+        seq_lens_cpu_upper_bound = torch.from_numpy(
+            np.pad(num_scheduled_tokens, (0, num_reqs_after_padding - num_reqs))
+        )
         return cls(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -260,14 +266,16 @@ def set_dummy_context(
 
     # Decode-like shape: each request continues after context_len
     # already-computed tokens.
-    input_batch.seq_lens += context_len
-    input_batch.seq_lens_cpu_upper_bound += context_len
+    input_batch.seq_lens[:num_reqs] += context_len
+    input_batch.seq_lens_cpu_upper_bound[:num_reqs] += context_len
     input_batch.num_computed_tokens_np.fill(context_len)
     input_batch.num_computed_prefill_tokens_np.fill(context_len)
     local_pos = np.arange(input_batch.num_tokens, dtype=np.int64) - np.repeat(
-        input_batch.query_start_loc_np[:-1], input_batch.num_scheduled_tokens
+        input_batch.query_start_loc_np[:num_reqs], input_batch.num_scheduled_tokens
     )
-    input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
+    input_batch.positions[: input_batch.num_tokens].copy_(
+        torch.from_numpy(local_pos + context_len)
+    )
 
     seq_len = context_len + query_len
     for block_table, block_size in zip(input_block_tables, block_tables.block_sizes):

@@ -41,7 +41,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -869,6 +869,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        route_dummy_tokens: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -948,6 +949,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 randomize_inputs=randomize_inputs,
+                route_dummy_tokens=route_dummy_tokens,
             )
         self.kv_connector.set_disabled(False)
 
@@ -1335,7 +1337,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
     def gather_batch_req_state(
-        self, scheduler_output: SchedulerOutput, dummy_run: bool
+        self,
+        scheduler_output: SchedulerOutput,
+        dummy_run: bool,
+        profiling: bool = False,
     ) -> tuple["BatchReqState | None", int | None]:
         """Gather CPU request state for the scheduled batch, in batch order.
         Returns (batch_state, uniform_decode_token_count)
@@ -1346,6 +1351,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
 
         if dummy_run:
+            if self.adaptive_verification is not None:
+                self.adaptive_verification.coordinate_parallel_step(
+                    num_tokens_per_req,
+                    {},
+                    has_prefill=False,
+                    dummy_run=True,
+                    profiling=profiling,
+                )
             # Dummy batches are uniform by construction.
             return None, get_uniform_decode_token_count(
                 num_reqs, num_toks, max_query_len, decode_graph_eligible=True
@@ -1368,6 +1381,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
         has_prefill = bool(is_prefilling_np.any())
+        if self.adaptive_verification is not None:
+            self.adaptive_verification.coordinate_parallel_step(
+                num_tokens_per_req,
+                draft_tokens,
+                has_prefill=has_prefill,
+                dummy_run=False,
+                profiling=profiling,
+                skip_drafts=scheduler_output.skip_drafts,
+            )
         max_seq_len_np = None
         if self.use_pp and has_prefill:
             # consumed by the PP `compute_need_sampled_mask` for batches with prefill.
@@ -1649,15 +1671,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self, input_batch: InputBatch, valid_state_slots: bool = False
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         block_table_provider = self.pcp_manager or self.block_tables
-        block_tables = block_table_provider.get_dummy_block_tables(input_batch.num_reqs)
+        block_tables = block_table_provider.get_dummy_block_tables(
+            input_batch.num_reqs_after_padding
+        )
         if valid_state_slots:
             state_slots = torch.arange(
                 1, input_batch.num_reqs + 1, dtype=torch.int32, device=self.device
             )
             for block_table in block_tables:
-                block_table[:, 0].copy_(state_slots)
+                block_table[: input_batch.num_reqs, 0].copy_(state_slots)
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
-            input_batch.num_tokens
+            input_batch.num_tokens_after_padding
         )
         return block_tables, slot_mappings
 
@@ -1795,8 +1819,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        route_dummy_tokens: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if self.runtime_timing is not None and not dummy_run:
+        if (
+            self.runtime_timing is not None
+            and not dummy_run
+            and (
+                self.adaptive_verification is None
+                or self.adaptive_verification.parallel_costs is None
+            )
+        ):
             self.runtime_timing.cancel()
             samples = self.runtime_timing.collect_ready()
             if samples and not self.runtime_profiling_active:
@@ -1833,7 +1865,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len: int | None = max(scheduler_output.num_scheduled_tokens.values())
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
-            scheduler_output, dummy_run
+            scheduler_output,
+            dummy_run,
+            profiling=is_profile or self.runtime_profiling_active,
         )
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
@@ -1930,11 +1964,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
                 # Profiling and warmup must route the dummy tokens to experts
                 # so MoE memory is measured and MoE kernels are exercised.
-                is_padding=not is_profile,
+                is_padding=not (is_profile or route_dummy_tokens),
             )
             if randomize_inputs:
                 # All-zero input_ids route every token to the same experts.
                 input_batch.input_ids.random_(0, self.vocab_size)
+                if route_dummy_tokens:
+                    get_tp_group().broadcast(input_batch.input_ids, src=0)
             if self.pcp_manager is not None:
                 input_batch = self.pcp_manager.prepare_inputs_for_capture_or_profile(
                     input_batch
@@ -2097,8 +2133,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and scheduler_output.num_spec_tokens_to_schedule
             == self.num_speculative_steps
         ):
-            self.runtime_timing.start(
-                input_batch.num_tokens_after_padding, input_batch.num_reqs
+            assert self.adaptive_verification is not None
+            self.adaptive_verification.start_runtime_timing(
+                input_batch,
+                dp_sync_state.num_tokens_across_dp
+                if dp_sync_state is not None
+                else None,
             )
 
         # Run model.

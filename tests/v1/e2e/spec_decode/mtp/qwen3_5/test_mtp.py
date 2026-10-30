@@ -74,7 +74,11 @@ def test_online_cost_feedback_tensor_parallel_generation(
 
 @pytest.mark.distributed(num_gpus=2)
 @pytest.mark.asyncio
-async def test_moe_mtp_dp_survives_idle_transitions(monkeypatch):
+@pytest.mark.parametrize("online_cost_feedback", [False, True], ids=["off", "on"])
+@pytest.mark.parametrize("expert_parallel", [False, True], ids=["noep", "ep"])
+async def test_moe_mtp_dp_survives_idle_transitions(
+    monkeypatch, tmp_path, online_cost_feedback, expert_parallel
+):
     """An idle replica preserves the target's batch shape during MTP prefill."""
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     model = os.environ.get("VLLM_TEST_MOE_MTP_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
@@ -113,9 +117,28 @@ async def test_moe_mtp_dp_survives_idle_transitions(monkeypatch):
                 "num_speculative_tokens": 3,
                 "enable_adaptive_verification": True,
                 "use_local_argmax_reduction": False,
+                "enable_online_cost_feedback": online_cost_feedback,
             }
         ),
     ]
+    if expert_parallel:
+        args += [
+            "--enable-expert-parallel",
+            "--all2all-backend",
+            "allgather_reducescatter",
+        ]
+    if online_cost_feedback:
+        args += [
+            "--profiler-config",
+            json.dumps(
+                {
+                    "profiler": "torch",
+                    "torch_profiler_dir": str(tmp_path / "profiles"),
+                    "torch_profiler_with_stack": False,
+                    "ignore_frontend": True,
+                }
+            ),
+        ]
     with RemoteOpenAIServer(
         model,
         args,
@@ -124,29 +147,104 @@ async def test_moe_mtp_dp_survives_idle_transitions(monkeypatch):
             "VLLM_USE_FLASHINFER_SAMPLER": "0",
             "VLLM_USE_DEEP_GEMM": "0",
             "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": "512",
+            "VLLM_SERVER_DEV_MODE": "1",
         },
         max_wait_seconds=900,
     ) as server:
         async with server.get_async_client() as client, httpx.AsyncClient() as health:
 
-            async def generate(index):
+            async def generate(index, tokens=64, prompt=None):
                 response = await client.completions.create(
                     model="moe-mtp-dp",
-                    prompt=f"Request {index}: continue.",
+                    prompt=prompt or f"Request {index}: continue.",
                     temperature=0,
-                    max_tokens=64,
+                    max_tokens=tokens,
                     extra_body={
                         "ignore_eos": True,
                         "allowed_token_ids": [42],
                         "return_token_ids": True,
                     },
                 )
-                assert response.choices[0].token_ids == [42] * 64
+                assert response.choices[0].token_ids == [42] * tokens
 
             for count in (32, 1, 8):
                 await asyncio.gather(*(generate(i) for i in range(count)))
                 response = await health.get(server.url_for("health"))
                 assert response.status_code == 200, response.text
+            await asyncio.gather(
+                generate(0, 32, "Continue the following: " + "hello " * 300),
+                generate(1, 128),
+            )
+            stream = await client.completions.create(
+                model="moe-mtp-dp",
+                prompt="Continue.",
+                max_tokens=2048,
+                temperature=0,
+                stream=True,
+                extra_body={"ignore_eos": True},
+            )
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].text:
+                    break
+            await stream.close()
+            await generate(2, 32)
+
+            async def cost_stats():
+                response = await health.post(
+                    server.url_for("collective_rpc"),
+                    json={"method": "get_online_cost_feedback_stats"},
+                    timeout=60,
+                )
+                response.raise_for_status()
+                values = response.json()["results"]
+                return [
+                    v
+                    for row in values
+                    for v in (row if isinstance(row, list) else [row])
+                ]
+
+            before = await cost_stats()
+            if online_cost_feedback:
+                drivers = [s for s in before if s.get("driver")]
+                assert len(drivers) == 1
+                assert drivers[0]["num_samples"] >= 10
+                assert all(
+                    s["num_samples"] is None for s in before if not s.get("driver")
+                )
+                response = await health.post(
+                    server.url_for("start_profile"), timeout=180
+                )
+                response.raise_for_status()
+                await generate(3, 32)
+                response = await health.post(
+                    server.url_for("stop_profile"), timeout=180
+                )
+                response.raise_for_status()
+                await generate(4, 64)
+                after = await cost_stats()
+                driver = next(s for s in after if s.get("driver"))
+                assert driver["epoch"] >= drivers[0]["epoch"] + 2
+                for observation in driver["observations"]:
+                    context = observation["context"]
+                    assert len(context["num_reqs_across_dp"]) == 2
+                    assert context["num_tokens_across_dp"][0] > 0
+                    assert context["epoch"] != drivers[0]["epoch"] + 1
+            else:
+                after = before
+                assert all(s == {"num_samples": None} for s in before)
+            (tmp_path / "online-cost-stats.json").write_text(
+                json.dumps(
+                    {
+                        "feedback": online_cost_feedback,
+                        "ep": expert_parallel,
+                        "before_profile": before,
+                        "after_profile": after,
+                    },
+                    indent=2,
+                )
+            )
+            response = await health.get(server.url_for("health"))
+            assert response.status_code == 200, response.text
 
 
 def _check_online_mtp_generation(

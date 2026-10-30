@@ -45,6 +45,10 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.parallel_cost import (
+    BudgetProposal,
+    select_parallel_budgets,
+)
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -623,7 +627,95 @@ def test_online_cost_feedback_accepts_tensor_and_data_parallel_configuration():
     assert config.target_parallel_config.data_parallel_size == 2
 
 
-def _online_tp_dp_worker(rank: int, tp_size: int, store: str, feedback=True) -> None:
+def test_parallel_budget_accounts_for_idle_padding_and_concurrent_samplers():
+    model = OnlineCostModel(
+        np.zeros(9), np.ones(9), [2, 4], forward_curve=[(2, 1.0), (4, 4.0)]
+    )
+    proposals = [
+        BudgetProposal(0, 4, np.zeros(1)),
+        BudgetProposal(1, 1, np.array([1.0, 1.9, 2.8, 3.7])),
+    ]
+    # The idle replica already forces four physical tokens. Trimming the active
+    # replica to two cannot buy a cheaper graph for the cooperating forward.
+    budgets, physical, cost = select_parallel_budgets(proposals, model)
+    assert budgets == (0, 3)
+    assert physical == 4
+    assert cost == 4.0
+    model.update(
+        [
+            RuntimeTimingSample(4.0, sampler_ms, 4, reqs)
+            for reqs, sampler_ms in [(1, 1.0), (3, 7.0)]
+            for _ in range(10)
+        ]
+    )
+    assert model.get_parallel_costs([1, 3], np.array([4])).tolist() == [11.0]
+
+
+def _check_online_moe_group(manager, rank, dp_rank, device):
+    list(manager.batches_to_profile([1, 2, 4]))
+    factor = float(rank + 1)
+    manager.set_cost_curves(
+        [(1, 1.0), (2, 1.0)],
+        [(1, 10.0), (2, 2.0), (4, 3.0)],
+        online_forward_curve=[(1, 10 * factor), (2, 2 * factor), (4, 3 * factor)],
+    )
+    coordinator = manager.parallel_costs
+    assert coordinator is not None
+    timing, model = manager.runtime_timing, manager.online_cost_model
+    assert (model is not None) == (rank == 0)
+    if model is not None:
+        assert model.get_parallel_costs([2, 1], np.array([4])).tolist() == [7.5]
+    proposal = BudgetProposal(
+        2 if dp_rank == 0 else 1,
+        2 if dp_rank == 0 else 1,
+        np.array([2.0, 2.9, 3.7]) if dp_rank == 0 else np.array([1.0, 1.9, 2.8, 3.7]),
+    )
+    first = coordinator.coordinate(proposal, model, timing, profiling=False)
+    assert first.budgets == (2, 3)
+    assert first.context.num_reqs_across_dp == (2, 1)
+    assert first.context.num_tokens_across_dp == (4, 4)
+    if timing is not None:
+        timing.start(4, 2, context=first.context)
+        torch.ones(128, device=device).sin_()
+        timing.forward_end()
+        timing.sampler_start()
+        torch.ones(128, device=device).cos_()
+        timing.sampler_end()
+    torch.accelerator.synchronize()
+    second = coordinator.coordinate(proposal, model, timing, profiling=False)
+    assert second.context.cost_version == 1
+    if model is not None:
+        assert model.num_samples == 1
+    # A follower's profiler vote excludes the entire cooperating step.
+    profiled = coordinator.coordinate(proposal, model, timing, profiling=rank == 3)
+    assert profiled.budgets is None
+    assert profiled.context.epoch > second.context.epoch
+    idle = BudgetProposal(0, 4, np.zeros(1)) if dp_rank == 0 else proposal
+    resumed = coordinator.coordinate(idle, model, timing, profiling=False)
+    assert resumed.budgets == (0, 3)
+    assert resumed.context.num_reqs_across_dp == (0, 1)
+    mixed = BudgetProposal(
+        proposal.num_reqs,
+        proposal.base_tokens,
+        proposal.accepted,
+        eligible=dp_rank == 0,
+    )
+    assert coordinator.coordinate(mixed, model, timing, profiling=False).budgets is None
+
+
+@multi_gpu_test(num_gpus=4)
+def test_online_tp_dp_moe_group_handles_idle_and_profiler_transitions(tmp_path):
+    mp.spawn(
+        _online_tp_dp_worker,
+        args=(2, str(tmp_path / "moe-cost-store"), True, True),
+        nprocs=4,
+        join=True,
+    )
+
+
+def _online_tp_dp_worker(
+    rank: int, tp_size: int, store: str, feedback=True, moe=False
+) -> None:
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="4")
     dp_rank = rank // tp_size
     device = torch.device(f"cuda:{rank}")
@@ -661,7 +753,11 @@ def _online_tp_dp_worker(rank: int, tp_size: int, store: str, feedback=True) -> 
                 1,
                 8,
                 enable_online_cost_feedback=feedback,
+                coordinate_moe_costs=moe,
             )
+            if moe:
+                _check_online_moe_group(manager, rank, dp_rank, device)
+                return
             list(manager.batches_to_profile([1, 2, 3, 4]))
             group = get_tp_group()
             up = float(np.nextafter(np.float32(0.5), np.float32(1)))

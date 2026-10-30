@@ -49,6 +49,11 @@ steps:
   commands:
     - pytest -v -s v1/spec_decode/test_adaptive_verification.py -k online_tp_dp
     - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_online_cost_feedback_tensor_parallel_generation
+    - >-
+      pytest -v -s
+      v1/worker/test_gpu_input_batch_v2.py
+      v1/worker/test_gpu_dp_utils.py
+    - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_moe_mtp_dp_survives_idle_transitions
 
 - label: ":nvidia: (H200 MIG 35GB) Spec Decode Eagle 1: DeepSeek + Qwen"
   key: spec-decode-eagle-1-deepseek-qwen

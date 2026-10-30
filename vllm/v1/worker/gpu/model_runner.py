@@ -1923,6 +1923,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc.num_tokens,
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
+                uniform_token_count=(
+                    dp_sync_state.uniform_token_count
+                    if dp_sync_state is not None
+                    else batch_desc.uniform_token_count
+                ),
                 # Profiling and warmup must route the dummy tokens to experts
                 # so MoE memory is measured and MoE kernels are exercised.
                 is_padding=not is_profile,

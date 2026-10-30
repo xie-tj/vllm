@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+import json
+import os
+
+import httpx
 import pytest
 
-from tests.utils import multi_gpu_test, single_gpu_only
+from tests.utils import RemoteOpenAIServer, multi_gpu_test, single_gpu_only
 from vllm import SamplingParams
 from vllm.config import CompilationConfig, CUDAGraphMode
 from vllm.platforms import current_platform
@@ -65,6 +70,83 @@ def test_online_cost_feedback_tensor_parallel_generation(
 ):
     """TP followers obey the leader's calibrated verification decisions."""
     _check_online_mtp_generation(monkeypatch, vllm_runner, True, tp_size=2)
+
+
+@pytest.mark.distributed(num_gpus=2)
+@pytest.mark.asyncio
+async def test_moe_mtp_dp_survives_idle_transitions(monkeypatch):
+    """An idle replica preserves the target's batch shape during MTP prefill."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model = os.environ.get("VLLM_TEST_MOE_MTP_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
+    args = [
+        "--served-model-name",
+        "moe-mtp-dp",
+        "--data-parallel-size",
+        "2",
+        "--data-parallel-size-local",
+        "2",
+        "--distributed-executor-backend",
+        "mp",
+        "--disable-custom-all-reduce",
+        "--language-model-only",
+        "--attention-backend",
+        "TRITON_ATTN",
+        "--gdn-prefill-backend",
+        "triton",
+        "--moe-backend",
+        "triton",
+        "--no-enable-prefix-caching",
+        "--max-model-len",
+        "4096",
+        "--max-num-batched-tokens",
+        "256",
+        "--max-num-seqs",
+        "32",
+        "--gpu-memory-utilization",
+        "0.80",
+        "--compilation-config",
+        '{"cudagraph_mode":"FULL_DECODE_ONLY"}',
+        "--speculative-config",
+        json.dumps(
+            {
+                "method": "mtp",
+                "num_speculative_tokens": 3,
+                "enable_adaptive_verification": True,
+                "use_local_argmax_reduction": False,
+            }
+        ),
+    ]
+    with RemoteOpenAIServer(
+        model,
+        args,
+        env_dict={
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "VLLM_USE_FLASHINFER_SAMPLER": "0",
+            "VLLM_USE_DEEP_GEMM": "0",
+            "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": "512",
+        },
+        max_wait_seconds=900,
+    ) as server:
+        async with server.get_async_client() as client, httpx.AsyncClient() as health:
+
+            async def generate(index):
+                response = await client.completions.create(
+                    model="moe-mtp-dp",
+                    prompt=f"Request {index}: continue.",
+                    temperature=0,
+                    max_tokens=64,
+                    extra_body={
+                        "ignore_eos": True,
+                        "allowed_token_ids": [42],
+                        "return_token_ids": True,
+                    },
+                )
+                assert response.choices[0].token_ids == [42] * 64
+
+            for count in (32, 1, 8):
+                await asyncio.gather(*(generate(i) for i in range(count)))
+                response = await health.get(server.url_for("health"))
+                assert response.status_code == 200, response.text
 
 
 def _check_online_mtp_generation(

@@ -72,6 +72,14 @@ def test_online_cost_feedback_tensor_parallel_generation(
     _check_online_mtp_generation(monkeypatch, vllm_runner, True, tp_size=2)
 
 
+@multi_gpu_test(num_gpus=1)
+def test_online_cost_feedback_native_backend_generation(
+    monkeypatch, vllm_runner, enable_pickle
+):
+    """The native backend selector finds a compatible variable-query backend."""
+    _check_online_mtp_generation(monkeypatch, vllm_runner, True, native_settings=True)
+
+
 @pytest.mark.distributed(num_gpus=2)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("online_cost_feedback", [False, True], ids=["off", "on"])
@@ -248,7 +256,7 @@ async def test_moe_mtp_dp_survives_idle_transitions(
 
 
 def _check_online_mtp_generation(
-    monkeypatch, vllm_runner, online_cost_feedback, tp_size=1
+    monkeypatch, vllm_runner, online_cost_feedback, tp_size=1, native_settings=False
 ):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "64")
@@ -267,8 +275,10 @@ def _check_online_mtp_generation(
         enable_chunked_prefill=True,
         enable_prefix_caching=False,
         limit_mm_per_prompt={"image": 0, "video": 0},
-        attention_backend="TRITON_ATTN",
-        compilation_config=CompilationConfig(
+        attention_backend=None if native_settings else "TRITON_ATTN",
+        compilation_config=CompilationConfig()
+        if native_settings
+        else CompilationConfig(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
             cudagraph_capture_sizes=[1, 4, 8],
         ),
@@ -303,6 +313,15 @@ def _check_online_mtp_generation(
             assert observed_samples[1:] == [None] * (tp_size - 1)
         else:
             assert observed_samples == [None] * tp_size
+        if native_settings:
+
+            def dummy_geometry(worker):
+                runner = worker.model_runner
+                with runner.step_timing.collect() as samples:
+                    runner._dummy_run(4, uniform_decode=True)
+                return [(s.num_target_tokens, s.num_reqs) for s in samples]
+
+            assert runner.llm.collective_rpc(dummy_geometry) == [[(4, 1)]]
 
 
 @single_gpu_only

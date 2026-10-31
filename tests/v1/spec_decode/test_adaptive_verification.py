@@ -33,6 +33,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.worker.gpu.async_utils import (
     RuntimeTimingCollector,
+    RuntimeTimingContext,
     RuntimeTimingSample,
     StepTimingSample,
 )
@@ -627,7 +628,7 @@ def test_online_cost_feedback_accepts_tensor_and_data_parallel_configuration():
     assert config.target_parallel_config.data_parallel_size == 2
 
 
-def test_parallel_budget_accounts_for_idle_padding_and_concurrent_samplers():
+def test_parallel_budget_accounts_for_idle_padding_and_group_sampler():
     model = OnlineCostModel(
         np.zeros(9), np.ones(9), [2, 4], forward_curve=[(2, 1.0), (4, 4.0)]
     )
@@ -637,7 +638,11 @@ def test_parallel_budget_accounts_for_idle_padding_and_concurrent_samplers():
     ]
     # The idle replica already forces four physical tokens. Trimming the active
     # replica to two cannot buy a cheaper graph for the cooperating forward.
-    budgets, physical, cost = select_parallel_budgets(proposals, model)
+    prices = np.zeros(9)
+    prices[model.graph_sizes] = model.get_forward_costs()
+    budgets, physical, cost = select_parallel_budgets(
+        proposals, prices, np.array(model.get_sampler_costs())
+    )
     assert budgets == (0, 3)
     assert physical == 4
     assert cost == 4.0
@@ -648,28 +653,111 @@ def test_parallel_budget_accounts_for_idle_padding_and_concurrent_samplers():
             for _ in range(10)
         ]
     )
-    assert model.get_parallel_costs([1, 3], np.array([4])).tolist() == [11.0]
+    prices[model.graph_sizes] = model.get_forward_costs()
+    proposals = [BudgetProposal(1, 1, np.ones(1)), BudgetProposal(3, 3, np.ones(1))]
+    assert (
+        select_parallel_budgets(proposals, prices, np.array(model.get_sampler_costs()))[
+            2
+        ]
+        == 11.0
+    )
+
+
+def test_coupled_sampler_uses_agreed_draft_batch_count():
+    """The driver's local N cannot identify a drafter padded by another DP."""
+    model = OnlineCostModel(np.zeros(5), np.ones(9), [4], forward_curve=[(4, 4.0)])
+
+    def sample(n_across_dp, sampler_ms):
+        context = RuntimeTimingContext(
+            1,
+            1,
+            0,
+            n_across_dp,
+            (4, 4),
+            n_across_dp,
+            0.0,
+        )
+        return RuntimeTimingSample(4.0, sampler_ms, 4, 1, context)
+
+    model.update([sample((1, 3), 7.0)] * 5)
+    model.update([sample((1, 1), 1.0)] * 5)
+    assert model.get_costs(3, np.array([4])).tolist() == [11.0]
+    assert model.get_costs(1, np.array([4])).tolist() == [5.0]
+
+
+def test_online_prices_exclude_piecewise_only_profile_shapes(dist_init):
+    """A native mixed graph profile may contain sizes without a FULL replay."""
+    device = torch.device("cuda")
+    states = RequestState(2, 32, 16, 3, 32, device)
+    buffers = InputBuffers(2, 16, device)
+    manager = AdaptiveVerificationManager(
+        states, buffers.query_start_loc, 1, 32, enable_online_cost_feedback=True
+    )
+    list(manager.batches_to_profile([4, 8]))
+    manager.set_initial_cost_curves(
+        [
+            StepTimingSample(4.0, 1.0, 4, 1, True),
+        ]
+        * 5
+        + [StepTimingSample(8.0, 1.0, 8, 2, False)] * 5
+    )
+    assert manager.online_cost_model is not None
+    assert manager.online_cost_model.graph_sizes.tolist() == [4]
+    states.add_request("req", 1, [0], 1, 15)
+    states.apply_staged_writes()
+    assert manager.get_num_tokens({"req": 4}, {"req": [1, 2, 3]}) <= 4
+
+
+def test_online_baseline_does_not_replace_native_profile_prices(dist_init, monkeypatch):
+    """The no-history forward baseline must not alter native fallback tables."""
+    monkeypatch.setenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "64")
+    device = torch.device("cuda")
+    states = RequestState(2, 32, 16, 3, 32, device)
+    buffers = InputBuffers(2, 16, device)
+    manager = AdaptiveVerificationManager(
+        states, buffers.query_start_loc, 1, 32, enable_online_cost_feedback=True
+    )
+    batches = list(manager.batches_to_profile([4, 8]))
+    samples = [
+        StepTimingSample(
+            1.0 if b["context_len"] == 0 else 9.0,
+            99.0 if b["context_len"] == 0 else 1.0,
+            b["num_tokens"],
+            1 if b["num_tokens"] == 4 else 2,
+            b["num_tokens"] <= 8,
+        )
+        for b in batches
+    ]
+    manager.set_initial_cost_curves(samples)
+    assert manager.cost_tables is not None
+    assert manager.cost_tables[0][1] == 1.0
+    assert manager.cost_tables[1][4] == 9.0
+    assert manager.online_cost_model is not None
+    assert manager.online_cost_model.get_costs(1, np.array([4])).tolist() == [1.0]
 
 
 def _check_online_moe_group(manager, rank, dp_rank, device):
     list(manager.batches_to_profile([1, 2, 4]))
     factor = float(rank + 1)
     manager.set_cost_curves(
-        [(1, 1.0), (2, 1.0)],
+        [(1, factor), (2, factor)],
         [(1, 10.0), (2, 2.0), (4, 3.0)],
         online_forward_curve=[(1, 10 * factor), (2, 2 * factor), (4, 3 * factor)],
     )
     coordinator = manager.parallel_costs
     assert coordinator is not None
+    assert manager.cost_tables[0][1] == 2 * dp_rank + 1
     timing, model = manager.runtime_timing, manager.online_cost_model
     assert (model is not None) == (rank == 0)
     if model is not None:
-        assert model.get_parallel_costs([2, 1], np.array([4])).tolist() == [7.5]
+        assert model.get_costs(2, np.array([4])).tolist() == [7.5]
     proposal = BudgetProposal(
         2 if dp_rank == 0 else 1,
         2 if dp_rank == 0 else 1,
         np.array([2.0, 2.9, 3.7]) if dp_rank == 0 else np.array([1.0, 1.9, 2.8, 3.7]),
     )
+    if not get_tp_group().is_first_rank:
+        proposal = replace(proposal, accepted=proposal.accepted * 0.5)
     first = coordinator.coordinate(proposal, model, timing, profiling=False)
     assert first.budgets == (2, 3)
     assert first.context.num_reqs_across_dp == (2, 1)
@@ -683,7 +771,9 @@ def _check_online_moe_group(manager, rank, dp_rank, device):
         timing.sampler_end()
     torch.accelerator.synchronize()
     second = coordinator.coordinate(proposal, model, timing, profiling=False)
-    assert second.context.cost_version == 1
+    assert second.context.cost_version == 0
+    third = coordinator.coordinate(proposal, model, timing, profiling=False)
+    assert third.context.cost_version == 1
     if model is not None:
         assert model.num_samples == 1
     # A follower's profiler vote excludes the entire cooperating step.

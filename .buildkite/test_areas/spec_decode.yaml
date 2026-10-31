@@ -41,6 +41,7 @@ steps:
   timeout_in_minutes: 20
   source_file_dependencies:
     - vllm/config/speculative.py
+    - vllm/v1/attention/
     - vllm/distributed/
     - vllm/v1/worker/gpu/
     - vllm/v1/worker/gpu_worker.py
@@ -49,6 +50,7 @@ steps:
   commands:
     - pytest -v -s v1/spec_decode/test_adaptive_verification.py -k online_tp_dp
     - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_online_cost_feedback_tensor_parallel_generation
+    - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_online_cost_feedback_native_backend_generation
     - >-
       pytest -v -s
       v1/worker/test_gpu_input_batch_v2.py

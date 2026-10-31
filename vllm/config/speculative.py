@@ -618,7 +618,7 @@ class SpeculativeConfig:
     """Update adaptive verification costs from completed runtime measurements.
     Requires enable_adaptive_verification. TP ranks share the leader's decisions;
     dense DP replicas calibrate independently. MoE DP/EP coordinates the entire
-    expert execution group using one driver cost model and a shared budget vector.
+    expert execution group using one driver cost model and shared prices.
     Disabled by default. FULL decode uses forward and runtime sampler estimates;
     unsupported paths retain the startup-profiled costs."""
 

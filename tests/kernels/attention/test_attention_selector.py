@@ -45,6 +45,28 @@ def clear_cache():
     _cached_get_attn_backend.cache_clear()
 
 
+def test_flash_attention_validates_adaptive_full_graph_requirement():
+    """Auto selection must reject FA2 before a variable-length graph is built."""
+    from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+
+    options = AttentionSelectorConfig(
+        head_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto", block_size=16
+    )._asdict()
+    native = FlashAttentionBackend.validate_configuration(
+        **options, device_capability=DeviceCapability(12, 0)
+    )
+    options["use_adaptive_verification"] = True
+    adaptive = FlashAttentionBackend.validate_configuration(
+        **options, device_capability=DeviceCapability(12, 0)
+    )
+    added = [r for r in adaptive if r not in native]
+    assert bool(added) == (
+        get_flash_attn_version() not in (3, 4) and not current_platform.is_xpu()
+    )
+    assert all("variable-length FULL" in reason for reason in added)
+
+
 # Define MLA and non-MLA backends separately
 DEVICE_MLA_BACKENDS = {
     "cuda": [

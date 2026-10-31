@@ -5,6 +5,7 @@
 from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from statistics import median
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -412,6 +413,8 @@ class OnlineCostModel:
         accepted = []
         for sample in samples:
             size, reqs = sample.num_target_tokens, sample.num_reqs
+            if sample.context is not None:
+                reqs = max(sample.context.num_reqs_across_dp)
             if (
                 size not in self._valid_graph_sizes
                 or not 0 < size < len(self.verify_cost)
@@ -449,7 +452,13 @@ class OnlineCostModel:
         values = self._sampler_samples.get(num_reqs)
         if values is None or len(values) < 5:
             values = self._sampler_fallback
-        return float(np.median(values)) if len(values) >= 5 else 0.0
+        return float(median(values)) if len(values) >= 5 else 0.0
+
+    def get_forward_costs(self) -> np.ndarray:
+        return self._forward_cost + self._slope * self.graph_sizes
+
+    def get_sampler_costs(self) -> list[float]:
+        return [0.0] + [self._sampler_ms(n) for n in range(1, len(self.draft_cost))]
 
     def get_costs(self, num_reqs: int, num_tokens: np.ndarray) -> np.ndarray:
         costs = self.draft_cost[num_reqs] + self.verify_cost[num_tokens]
@@ -463,20 +472,11 @@ class OnlineCostModel:
         )
         return np.maximum(costs, 1e-6)
 
-    def get_parallel_costs(
-        self, num_reqs: list[int], physical_tokens: np.ndarray
-    ) -> np.ndarray:
-        """Price a cooperating forward and concurrent replica samplers."""
-        indices = np.searchsorted(self.graph_sizes, physical_tokens)
-        sampler_ms = max((self._sampler_ms(n) for n in num_reqs if n), default=0.0)
-        return np.maximum(
-            self._forward_cost[indices] + self._slope * physical_tokens + sampler_ms,
-            1e-6,
-        )
-
 
 class AdaptiveVerificationManager:
     parallel_costs: ParallelCostCoordinator | None = None
+    enable_online_cost_feedback = False
+    _native_profile_count = 0
 
     def __init__(
         self,
@@ -487,8 +487,11 @@ class AdaptiveVerificationManager:
         copy_admitted_drafts_to_host: bool = False,
         enable_online_cost_feedback: bool = False,
         coordinate_moe_costs: bool = False,
+        profile_moe: bool = False,
     ):
         self.req_states = req_states
+        self.enable_online_cost_feedback = enable_online_cost_feedback
+        self.profile_moe = profile_moe
         self.num_speculative_steps = req_states.num_speculative_steps
         device = req_states.device
         self._copy_stream = torch.cuda.Stream(device)
@@ -591,23 +594,35 @@ class AdaptiveVerificationManager:
                 size = min(size * 2, max_num_tokens)
                 tail_sizes.add(size)
             tail_sizes -= set(capture_sizes)
-        for num_tokens in capture_sizes + sorted(tail_sizes):
+        native_sizes = capture_sizes + sorted(tail_sizes)
+        self._native_profile_count = len(native_sizes) * _PROFILE_REPLAYS
+        for num_tokens in native_sizes:
             for _ in range(_PROFILE_REPLAYS):
-                if self.parallel_costs is not None:
-                    with gpu_sync_allowed():
-                        torch.accelerator.synchronize()
-                    self.parallel_costs.group.barrier()
                 yield {
                     "num_tokens": num_tokens,
                     "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
-                    **(
-                        {"randomize_inputs": True, "route_dummy_tokens": True}
-                        if self.parallel_costs is not None
-                        else {}
-                    ),
+                }
+        if not self.enable_online_cost_feedback:
+            return
+        # Keep native fallback profiling intact; the online baseline has no history.
+        group = self.parallel_costs.group if self.parallel_costs else get_tp_group()
+        for num_tokens in capture_sizes:
+            for _ in range(_PROFILE_REPLAYS):
+                with gpu_sync_allowed():
+                    torch.accelerator.synchronize()
+                group.barrier()
+                yield {
+                    "num_tokens": num_tokens,
+                    "context_len": 0,
+                    "randomize_inputs": self.profile_moe,
+                    "route_dummy_tokens": self.profile_moe,
                 }
 
     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
+        end = self._native_profile_count or len(samples)
+        native_samples = samples[:end]
+        online_samples = samples[end:] or native_samples
+
         def median_curve(
             points: Iterable[tuple[int, float]],
         ) -> list[tuple[int, float]]:
@@ -621,15 +636,15 @@ class AdaptiveVerificationManager:
         # and request counts — unlike token counts — collide across execution
         # modes, so only graph-replay samples may price the draft curve.
         draft_curve = median_curve(
-            (s.num_reqs, s.drafter_ms) for s in samples if s.full_cudagraph
+            (s.num_reqs, s.drafter_ms) for s in native_samples if s.full_cudagraph
         )
         verify_curve = median_curve(
-            (s.num_target_tokens, s.forward_ms) for s in samples
+            (s.num_target_tokens, s.forward_ms) for s in native_samples
         )
         online_forward_curve = None
-        if self.runtime_timing is not None or self.parallel_costs is not None:
+        if self.enable_online_cost_feedback:
             grouped: defaultdict[int, list[float]] = defaultdict(list)
-            for sample in samples:
+            for sample in online_samples:
                 if sample.full_cudagraph:
                     grouped[sample.num_target_tokens].append(sample.forward_ms)
             online_forward_curve = []
@@ -648,31 +663,28 @@ class AdaptiveVerificationManager:
         *,
         online_forward_curve: list[tuple[int, float]] | None = None,
     ) -> None:
-        if self.parallel_costs is not None:
-            group = self.parallel_costs.group
-            curves = (draft_curve, verify_curve, online_forward_curve or [])
-            keys = tuple(tuple(k for k, _ in curve) for curve in curves)
+        if online_forward_curve is not None:
+            group = self.parallel_costs.group if self.parallel_costs else get_tp_group()
+            keys = tuple(k for k, _ in online_forward_curve)
             common_keys = group.broadcast_object(keys, src=0)
             values = (
-                [v for curve in curves for _, v in curve]
+                [v for _, v in online_forward_curve]
                 if keys == common_keys
-                else [0.0] * sum(map(len, common_keys))
+                else [0.0] * len(common_keys)
             )
             packed = torch.tensor(
                 values + [float(keys == common_keys)], dtype=torch.float64
             )
             group.cpu_all_reduce_(packed)
             assert packed[-1] == group.world_size, "MoE profile shapes disagree"
-            averaged = iter((packed[:-1] / group.world_size).tolist())
-            draft_curve, verify_curve, online_forward_curve = (
-                [(k, next(averaged)) for k in sizes] for sizes in common_keys
+            online_forward_curve = list(
+                zip(common_keys, (packed[:-1] / group.world_size).tolist())
             )
-        else:
-            draft_curve, verify_curve, online_forward_curve = (
-                get_tp_group().broadcast_object(
-                    (draft_curve, verify_curve, online_forward_curve), src=0
-                )
+        draft_curve, verify_curve, online_forward_curve = (
+            get_tp_group().broadcast_object(
+                (draft_curve, verify_curve, online_forward_curve), src=0
             )
+        )
         if not draft_curve or not verify_curve:
             raise RuntimeError(
                 "Adaptive verification could not profile step costs. Pass "
@@ -686,10 +698,20 @@ class AdaptiveVerificationManager:
             self.req_states.max_num_batched_tokens,
             self._cudagraph_limit,
         )
+        if online_forward_curve is not None:
+            if not online_forward_curve:
+                raise RuntimeError(
+                    "Online cost feedback requires captured FULL decode graphs."
+                )
+            self._cudagraph_limit = online_forward_curve[-1][0]
         if self.runtime_timing is not None:
             self.online_cost_model = OnlineCostModel(
                 *self.cost_tables,
-                [size for size, _ in verify_curve if size <= self._cudagraph_limit],
+                [
+                    size
+                    for size, _ in (online_forward_curve or verify_curve)
+                    if size <= self._cudagraph_limit
+                ],
                 forward_curve=online_forward_curve,
             )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
@@ -1124,4 +1146,5 @@ def maybe_create_adaptive_verification_manager(
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
         enable_online_cost_feedback=online,
         coordinate_moe_costs=coordinate_moe,
+        profile_moe=bool(vllm_config.model_config and vllm_config.model_config.is_moe),
     )

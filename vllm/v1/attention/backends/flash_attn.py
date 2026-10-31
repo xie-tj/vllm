@@ -284,6 +284,22 @@ class FA4DenseAttentionKernel(VllmJitKernel["FA4DenseAttentionKernel.CompileKey"
 
 
 class FlashAttentionBackend(AttentionBackend):
+    @classmethod
+    def validate_configuration(
+        cls, *args: Any, use_adaptive_verification: bool = False, **kwargs: Any
+    ) -> list[str]:
+        kwargs["use_adaptive_verification"] = use_adaptive_verification
+        reasons = super().validate_configuration(*args, **kwargs)
+        if (
+            use_adaptive_verification
+            and get_flash_attn_version() not in (3, 4)
+            and not current_platform.is_xpu()
+        ):
+            reasons.append(
+                "variable-length FULL CUDA graphs require FlashAttention 3 or 4"
+            )
+        return reasons
+
     supports_kv_cache_update_bypass: bool = True
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]

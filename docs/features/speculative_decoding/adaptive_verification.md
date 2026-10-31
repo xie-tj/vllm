@@ -56,6 +56,9 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 - Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.
 - Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries) or pipeline parallelism (cost curves and confidences exist only on the last rank).
 - Without a confidence head, `use_local_argmax_reduction` is rejected. The estimator needs the full draft logits, which local argmax reduction never materializes.
+- Automatic backend selection excludes FlashAttention 2 for adaptive verification
+  because its FULL graphs require uniform query lengths. Compatible backends
+  keep their normal priority; explicit incompatible choices are still rejected.
 
 ## Tuning the cost profile
 
@@ -82,7 +85,8 @@ configuration, enable it with:
 ```
 
 The feedback uses a DeepInfer-style robust estimator. Its captured forward
-curve uses five startup measurements per physical token size, discards the
+curve is measured separately with no prior KV history, using five startup
+measurements per FULL physical token size. It discards the
 minimum and maximum, and averages the remaining three. The raw curve is not
 made monotonic: candidates use the next captured size's original cost, even
 when a larger graph measured faster. Runtime residuals use this same raw
@@ -143,21 +147,25 @@ with four independent cost models.
 
 MoE data parallelism and expert parallelism use one cost model for the TP×DP
 expert execution group. Each DP replica contributes its expected accepted tokens;
-the group driver chooses the complete vector of replica budgets against their
+the group chooses the complete vector of replica budgets against their
 common physical graph size, including padding imposed by idle replicas. Its
 objective is total expected acceptance divided by the cooperating forward cost
-plus the largest predicted replica sampler cost. Request counts remain local to
-each replica's sampler; they are not summed into a fictitious global sampler.
+plus a driver sampler estimate indexed by the largest real replica request count,
+the agreed batch count used by vLLM's cooperating MTP decode. Local request counts
+remain in observation metadata; they are not summed into a global sampler.
 Only the group driver records runtime observations. Startup forward curves use
 the group mean of rank-local trimmed measurements, with valid dummy tokens and
 randomized token inputs routed through the normal MoE router.
 
-All ranks, including idle ranks, participate in each decision in the same order.
+All ranks, including idle ranks, participate in one metadata/price reduction per
+decision. The driver alone learns runtime costs. Every rank derives identical
+budgets from the same published prices and acceptance data, without an extra
+object broadcast. Collected observations enter the following step's prices.
 Decisions and observations carry a step, cost version, profiler epoch, replica
 request counts and physical shapes. If any rank is profiling or a replica has
 prefill, the entire group falls back to startup costs. The driver does not learn
-from dummy sampler work. The existing estimator approximates other replicas'
-sampler costs using observations from the same driver and the same 9/5 fallback.
+from dummy sampler work. The same 9/5 sampler rule applies to the cooperating
+draft batch; this remains a driver estimate, not an all-rank latency average.
 Worker `get_online_cost_feedback_stats` collective RPC returns bounded observation
 and admitted-budget diagnostics for verification and performance analysis.
 

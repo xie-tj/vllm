@@ -885,14 +885,28 @@ def test_online_moe_factory_limits_joint_coordination_to_dp(
         )
 
 
-def test_sampler_prices_refresh_after_new_observations():
+@pytest.mark.parametrize("max_num_reqs", [3, 128])
+def test_sampler_prices_refresh_after_new_observations(max_num_reqs):
     """Published sampler prices must track both bucket and fallback updates."""
-    model = OnlineCostModel(np.zeros(4), np.ones(9), [4])
-    assert model.get_sampler_costs() == [0.0] * 4
-    model.update([RuntimeTimingSample(4.0, 7.0, 4, 2)] * 5)
-    assert model.get_sampler_costs() == [0.0, 7.0, 7.0, 7.0]
-    model.update([RuntimeTimingSample(4.0, 1.0, 4, 1)] * 5)
-    assert model.get_sampler_costs() == [0.0, 1.0, 7.0, 1.0]
+    model = OnlineCostModel(np.zeros(max_num_reqs + 1), np.ones(513), [512])
+    assert model.get_sampler_costs() == [0.0] * (max_num_reqs + 1)
+    model.update([RuntimeTimingSample(1.0, 7.0, 512, 2)] * 5)
+    assert model.get_sampler_costs() == [0.0] + [7.0] * max_num_reqs
+    model.update([RuntimeTimingSample(1.0, 1.0, 512, 1)] * 5)
+    assert model.get_sampler_costs() == [0.0, 1.0, 7.0] + [1.0] * (max_num_reqs - 2)
+    observations = [(2, latency) for latency in range(9, 18)] + [
+        (max_num_reqs, latency) for latency in range(23, 28)
+    ]
+    for num_reqs, latency in observations:
+        model.update([RuntimeTimingSample(1.0, float(latency), 512, num_reqs)])
+        costs = model.get_sampler_costs()
+        assert costs == [0.0] + [
+            model.get_costs(n, np.array([512]))[0] - 1.0
+            for n in range(1, max_num_reqs + 1)
+        ]
+        assert model.get_sampler_costs() is costs
+    model.update([RuntimeTimingSample(float("nan"), 999.0, 512, 2)])
+    assert model.get_sampler_costs() is costs
 
 
 def test_shorter_proposal_uses_native_prices_without_changing_schedule(dist_init):

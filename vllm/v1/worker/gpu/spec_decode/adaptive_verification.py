@@ -359,9 +359,17 @@ class OnlineCostModel:
 
     def get_sampler_costs(self) -> list[float]:
         if self._sampler_costs is None:
-            self._sampler_costs = [0.0] + [
-                self._sampler_ms(n) for n in range(1, len(self.draft_cost))
-            ]
+            fallback = (
+                float(median(self._sampler_fallback))
+                if len(self._sampler_fallback) >= 5
+                else 0.0
+            )
+            costs = [fallback] * len(self.draft_cost)
+            costs[0] = 0.0
+            for num_reqs, values in self._sampler_samples.items():
+                if len(values) >= 5:
+                    costs[num_reqs] = float(median(values))
+            self._sampler_costs = costs
         return self._sampler_costs
 
     def get_costs(self, num_reqs: int, num_tokens: np.ndarray) -> np.ndarray:

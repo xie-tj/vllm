@@ -1920,22 +1920,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        agreed_dp_sync = None
-        if (
-            self.adaptive_verification is not None
-            and not self.is_encoder_decoder
-            and self.lora_config is None
-        ):
-            agreed_dp_sync = self.adaptive_verification.get_dp_sync_state()
-        dispatch_tokens = (
-            int(agreed_dp_sync.num_tokens_across_dp[self.dp_rank])
-            if agreed_dp_sync is not None
-            else num_toks
-        )
         batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
-            dispatch_tokens,
+            num_toks,
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
@@ -1948,7 +1936,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
             allow_skip_drafts=scheduler_output.skip_drafts,
-            dp_sync_state=agreed_dp_sync,
         )
 
         if batch_desc.num_tokens == 0:

@@ -1169,15 +1169,8 @@ def _nonblocking_confidence_worker(rank: int, store: str) -> None:
                 assert coordinator.decision is not None
                 if phase == 0:
                     assert coordinator.decision.budgets == (6, 6)
-                    agreed = manager.get_dp_sync_state()
-                    assert agreed is not None
-                    assert agreed.num_tokens_across_dp.tolist() == [8, 8]
-                    assert agreed.uniform_token_count == agreed.max_query_len == 4
-                    assert agreed.num_reqs == 2 and not agreed.eager
-                    assert not agreed.skip_drafts
                 else:
                     assert coordinator.decision.budgets is None
-                    assert manager.get_dp_sync_state() is None
             assert manager.get_num_tokens(tokens, drafts, has_prefill=True) == 4
             cu_logits, query_lens, *_ = manager.reallocate_drafts(
                 req_ids, batch.idx_mapping
@@ -1185,34 +1178,6 @@ def _nonblocking_confidence_worker(rank: int, store: str) -> None:
             # GPU ranking still sees the new live values when a host copy is skipped.
             assert cu_logits.tolist() == [0, 1, 4]
             assert query_lens[:3].tolist() == [0, 1, 4]
-            # Filling a clipped logit capacity is not a full uniform query.
-            clipped = BudgetProposal(2, 2, np.array([2.0, 3.0, 4.0]))
-            decision = coordinator.coordinate(
-                clipped,
-                manager.online_cost_model,
-                manager.runtime_timing,
-                profiling=False,
-            )
-            assert decision.budgets == (2, 2)
-            assert manager.get_dp_sync_state() is None
-            # The same total can also contain extra non-drafts and fewer drafts.
-            extra_base = BudgetProposal(2, 6, np.array([2.0, 3.0, 4.0]))
-            decision = coordinator.coordinate(
-                extra_base,
-                manager.online_cost_model,
-                manager.runtime_timing,
-                profiling=False,
-            )
-            assert decision.context.num_valid_tokens_across_dp == (8, 8)
-            assert manager.get_dp_sync_state() is None
-            idle = BudgetProposal(0, 1, np.zeros(1)) if rank >= 4 else clipped
-            coordinator.coordinate(
-                idle,
-                manager.online_cost_model,
-                manager.runtime_timing,
-                profiling=False,
-            )
-            assert manager.get_dp_sync_state() is None
         finally:
             cleanup_dist_env_and_memory()
 

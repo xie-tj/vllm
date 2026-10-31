@@ -40,7 +40,6 @@ _PROFILE_REPLAYS = 5
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.worker.gpu.dp_utils import DPSyncState
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.states import RequestState
     from vllm.v1.worker.utils import AttentionGroup
@@ -668,41 +667,6 @@ class AdaptiveVerificationManager:
             proposal, self.online_cost_model, self.runtime_timing, profiling=profiling
         )
 
-    def get_dp_sync_state(self) -> "DPSyncState | None":
-        """Reuse a joint decision only for a real, untrimmed uniform decode."""
-        if self.parallel_costs is None:
-            return None
-        decision = self.parallel_costs.decision
-        if decision is None or decision.budgets is None:
-            return None
-        context = decision.context
-        counts = context.num_reqs_across_dp
-        width = self.num_speculative_steps + self.num_bonus_tokens
-        # Drafts have an upper bound and non-drafts a per-request lower bound.
-        # Both totals at their bounds prove that every query has the same width.
-        if any(
-            n <= 0 or budget != n * self.num_speculative_steps or tokens != n * width
-            for n, budget, tokens in zip(
-                counts,
-                decision.budgets,
-                context.num_valid_tokens_across_dp,
-                strict=True,
-            )
-        ):
-            return None
-        from vllm.v1.worker.gpu.dp_utils import DPSyncState
-
-        self.parallel_costs.dp_sync_reuses += 1
-        return DPSyncState(
-            num_tokens_across_dp=torch.tensor(
-                context.num_tokens_across_dp, dtype=torch.int32, device="cpu"
-            ),
-            uniform_token_count=width,
-            max_query_len=width,
-            eager=False,
-            num_reqs=max(counts),
-        )
-
     def start_runtime_timing(
         self,
         input_batch: "InputBatch",
@@ -734,18 +698,21 @@ class AdaptiveVerificationManager:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
         num_reqs = input_batch.num_reqs
-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
         if not self._needs_host_confidences:
+            self._confidence_probs[input_batch.idx_mapping] = confidence_probs[
+                :num_reqs
+            ]
             self._pending_resets.clear()
             return None
         ready_idx = self._stale_idx ^ 1
-        if self.parallel_costs is not None:
-            # Keep reading the completed slot while its replacement is in flight.
-            if not self._copy_events[ready_idx].query():
-                return None
-        else:
-            with gpu_sync_allowed():
-                self._copy_events[ready_idx].synchronize()
+        if self.parallel_costs is not None and not self._copy_events[ready_idx].query():
+            # Keep the completed host slot, but always publish current GPU values.
+            self._confidence_probs[input_batch.idx_mapping] = confidence_probs[
+                :num_reqs
+            ]
+            return None
+        with gpu_sync_allowed():
+            self._copy_events[ready_idx].synchronize()
         if self._pending_resets:
             self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
             self._pending_resets.clear()
@@ -753,6 +720,7 @@ class AdaptiveVerificationManager:
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
 
+        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
 

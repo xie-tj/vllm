@@ -141,6 +141,12 @@ layout. This keeps execution shapes consistent despite rank-local timing or
 confidence differences. Other TP ranks do not run independent calibrators.
 Budget and layout consensus also applies when cost feedback is disabled.
 
+Stale acceptance scores keep the same two-round delay. Publishing confidence
+copies does not wait on the host: GPU staging slots wait for their previous copy,
+and the host fences a stale slot only when a budget reads it. Request-slot resets
+are applied after the corresponding copy completes, so reuse cannot expose a
+previous request's scores.
+
 Dense data-parallel replicas learn independently within their own TP groups.
 For example, `--tensor-parallel-size 2 --data-parallel-size 4` uses eight GPUs
 with four independent cost models.

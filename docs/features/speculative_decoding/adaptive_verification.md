@@ -211,6 +211,9 @@ contribute acceptance vectors; TP followers retain GPU confidence updates and
 metadata votes. Startup fallback budgets retain TP consensus. Sampler price
 tables are reused until observations
 change. Collected observations enter the following step's prices.
+When every replica retains its full uniform decode query, the joint decision
+also supplies the native DP padding agreement, avoiding a second collective.
+Idle, mixed, trimmed and profiler steps retain normal DP coordination.
 Decisions and observations carry a step, cost version, profiler epoch, replica
 request counts and physical shapes. If any rank is profiling or a replica has
 prefill, the entire group falls back to startup costs. The driver does not learn

@@ -87,6 +87,7 @@ class ParallelCostCoordinator:
         self._profile_mask: tuple[bool, ...] = ()
         self.decision: ParallelCostDecision | None = None
         self.elapsed_ms = 0.0
+        self.dp_sync_reuses = 0
         self.budgets: list[Counter[int]] = [Counter() for _ in range(self.dp_size)]
         self.shapes: Counter[int] = Counter()
         self.observations: deque[dict] = deque(maxlen=256)
@@ -206,6 +207,7 @@ class ParallelCostCoordinator:
             "epoch": self.epoch,
             "cost_version": self.cost_version,
             "coordination_ms": self.elapsed_ms,
+            "dp_sync_reuses": self.dp_sync_reuses,
             "budgets": [sorted(c.items()) for c in self.budgets],
             "physical_shapes": sorted(self.shapes.items()),
             "observations": [

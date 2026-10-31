@@ -477,7 +477,6 @@ class AdaptiveVerificationManager:
     parallel_costs: ParallelCostCoordinator | None = None
     enable_online_cost_feedback = False
     _native_profile_count = 0
-    _confidence_read_pending = False
 
     def __init__(
         self,
@@ -560,7 +559,7 @@ class AdaptiveVerificationManager:
             for _ in range(2)
         ]
         self._copy_events = [torch.cuda.Event(blocking=True) for _ in range(2)]
-        self._pending_resets: list[set[int]] = [set(), set()]
+        self._pending_resets: list[int] = []
         self._stale_idx = 0
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
@@ -574,21 +573,9 @@ class AdaptiveVerificationManager:
         )
 
     def add_request(self, req_idx: int) -> None:
-        for pending in self._pending_resets:
-            pending.add(req_idx)
-        self._confidence_read_pending = True
+        self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
+        self._pending_resets.append(req_idx)
         self._confidence_probs[req_idx].fill_(1.0)
-
-    def _read_stale_confidences(self) -> np.ndarray:
-        if self._confidence_read_pending:
-            with gpu_sync_allowed():
-                self._copy_events[self._stale_idx].synchronize()
-            pending = self._pending_resets[self._stale_idx]
-            if pending:
-                self._stale_confidences[self._stale_idx].np[list(pending)] = 1.0
-                pending.clear()
-            self._confidence_read_pending = False
-        return self._stale_confidences[self._stale_idx].np
 
     def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
@@ -761,7 +748,7 @@ class AdaptiveVerificationManager:
                     self._max_total_logits - len(req_ids) * self.num_bonus_tokens,
                 ),
             )
-            stale = self._read_stale_confidences()[slots]
+            stale = self._stale_confidences[self._stale_idx].np[slots]
             survival = np.cumprod(stale.astype(np.float64), axis=1)
             valid = np.arange(self.num_speculative_steps)[None, :] < drafts[:, None]
             scores = np.sort(survival[valid])[::-1][:capacity]
@@ -806,18 +793,21 @@ class AdaptiveVerificationManager:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
         num_reqs = input_batch.num_reqs
-        self._stale_idx, write_idx = self._stale_idx ^ 1, self._stale_idx
-        self._confidence_read_pending = True
+        ready_idx = self._stale_idx ^ 1
+        with gpu_sync_allowed():
+            self._copy_events[ready_idx].synchronize()
+        if self._pending_resets:
+            self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
+            self._pending_resets.clear()
+        # Last step's copy has landed: budgets read it, this step overwrites the
+        # slot they were reading before.
+        self._stale_idx, write_idx = ready_idx, self._stale_idx
 
         self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
         write_slot = self._stale_confidences[write_idx]
-        current_stream = torch.cuda.current_stream(self.req_states.device)
-        # Reuse the GPU staging slot only after its previous D2H copy, without
-        # blocking the host before the next budget actually reads stale scores.
-        current_stream.wait_event(self._copy_events[write_idx])
         write_slot.gpu.copy_(self._confidence_probs)
-        self._pending_resets[write_idx].clear()
 
+        current_stream = torch.cuda.current_stream(self.req_states.device)
         self._copy_stream.wait_stream(current_stream)
         with stream(self._copy_stream, current_stream):
             write_slot.copy_to_cpu()
@@ -865,7 +855,7 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=num_reqs,
         )
-        stale_confidences = self._read_stale_confidences()[slots]
+        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
         steps = np.arange(self.num_speculative_steps)
         valid = steps[None, :] < scheduled_drafts[:, None]

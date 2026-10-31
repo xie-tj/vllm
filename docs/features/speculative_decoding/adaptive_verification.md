@@ -208,7 +208,12 @@ costs. Every rank derives identical
 budgets from the same published prices and acceptance data, without an extra
 object broadcast. Only DP leaders copy confidence histories to the host and
 contribute acceptance vectors; TP followers retain GPU confidence updates and
-metadata votes. Startup fallback budgets retain TP consensus. Sampler price
+metadata votes. Leaders consume only completed host histories: if the next
+confidence copy is still in flight, they keep the previous history and omit a
+new host copy for that step. GPU ranking confidences are still updated every
+step, and request-slot resets are applied when the completed history is adopted.
+DP=1 and feedback-disabled history publication retain their existing behavior.
+Startup fallback budgets retain TP consensus. Sampler price
 tables are reused until observations
 change. Collected observations enter the following step's prices.
 When every replica retains its full uniform decode query, the joint decision

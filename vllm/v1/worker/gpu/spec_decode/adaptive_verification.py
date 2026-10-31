@@ -734,15 +734,18 @@ class AdaptiveVerificationManager:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
         num_reqs = input_batch.num_reqs
+        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
         if not self._needs_host_confidences:
-            self._confidence_probs[input_batch.idx_mapping] = confidence_probs[
-                :num_reqs
-            ]
             self._pending_resets.clear()
             return None
         ready_idx = self._stale_idx ^ 1
-        with gpu_sync_allowed():
-            self._copy_events[ready_idx].synchronize()
+        if self.parallel_costs is not None:
+            # Keep reading the completed slot while its replacement is in flight.
+            if not self._copy_events[ready_idx].query():
+                return None
+        else:
+            with gpu_sync_allowed():
+                self._copy_events[ready_idx].synchronize()
         if self._pending_resets:
             self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
             self._pending_resets.clear()
@@ -750,7 +753,6 @@ class AdaptiveVerificationManager:
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
 
-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
 

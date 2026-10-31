@@ -1068,19 +1068,17 @@ def test_startup_random_routing_preserves_serving_graphs_and_rng(
 
 
 @multi_gpu_test(num_gpus=8)
-def test_online_tp_dp_metadata_only_followers_do_not_wait_for_confidence_copies(
-    tmp_path,
-):
-    """Only TP leaders consume host confidences for the joint DP budget."""
+def test_online_tp_dp_confidence_copies_do_not_block(tmp_path):
+    """Joint budgets consume completed histories without waiting for D2H."""
     mp.spawn(
-        _metadata_only_follower_worker,
+        _nonblocking_confidence_worker,
         args=(str(tmp_path / "metadata-only-store"),),
         nprocs=8,
         join=True,
     )
 
 
-def _metadata_only_follower_worker(rank: int, store: str) -> None:
+def _nonblocking_confidence_worker(rank: int, store: str) -> None:
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="8")
     device = torch.device(f"cuda:{rank}")
     torch.accelerator.set_device_index(device)
@@ -1128,22 +1126,21 @@ def _metadata_only_follower_worker(rank: int, store: str) -> None:
                 coordinate_moe_costs=True,
             )
             probabilities = torch.full((2, 3), 0.9, device=device)
+            live = torch.tensor([[0.1] * 3, [0.9] * 3], device=device)
             for _ in range(2):
                 manager.record_confidences(probabilities, batch)
             torch.accelerator.synchronize()
-            follower = not get_tp_group().is_first_rank
             done = torch.Event(device=device)
-            if follower:
-                # Bounded GPU work keeps the old copy pending; query, not a
-                # wall-time threshold, proves that the host returned early.
-                torch.cuda._sleep(2_000_000_000)
-                done.record()
-            for _ in range(2):
-                manager.record_confidences(probabilities, batch)
-            blocked = torch.tensor(int(follower and done.query()))
+            # Bounded GPU work keeps a copy pending on both leaders and
+            # followers. An event query proves that the host returned early.
+            torch.cuda._sleep(2_000_000_000)
+            done.record()
+            for values in (probabilities, live):
+                manager.record_confidences(values, batch)
+            blocked = torch.tensor(int(done.query()))
             torch.accelerator.synchronize()
             dist.all_reduce(blocked, group=get_world_group().cpu_group)
-            assert blocked.item() == 0, "Metadata-only followers waited for D2H"
+            assert blocked.item() == 0, "Online confidence publishing waited for D2H"
 
             list(manager.batches_to_profile([4, 8]))
             manager.set_initial_cost_curves(
@@ -1185,8 +1182,9 @@ def _metadata_only_follower_worker(rank: int, store: str) -> None:
             cu_logits, query_lens, *_ = manager.reallocate_drafts(
                 req_ids, batch.idx_mapping
             )
-            assert cu_logits.tolist() == [0, 2, 4]
-            assert query_lens[:3].tolist() == [0, 2, 4]
+            # GPU ranking still sees the new live values when a host copy is skipped.
+            assert cu_logits.tolist() == [0, 1, 4]
+            assert query_lens[:3].tolist() == [0, 1, 4]
             # Filling a clipped logit capacity is not a full uniform query.
             clipped = BudgetProposal(2, 2, np.array([2.0, 3.0, 4.0]))
             decision = coordinator.coordinate(

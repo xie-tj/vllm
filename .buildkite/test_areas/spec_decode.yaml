@@ -44,7 +44,7 @@ steps:
     - vllm/v1/worker/gpu/
     - tests/v1/spec_decode/test_adaptive_verification.py
   commands:
-    - pytest -v -s v1/spec_decode/test_adaptive_verification.py::test_online_tp_dp_metadata_only_followers_do_not_wait_for_confidence_copies
+    - pytest -v -s v1/spec_decode/test_adaptive_verification.py::test_online_tp_dp_confidence_copies_do_not_block
 
 - label: ":nvidia: (H100) Online AV TP and DP"
   key: online-av-tp-dp

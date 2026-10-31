@@ -29,6 +29,7 @@ from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
     get_tp_group,
+    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -1064,6 +1065,123 @@ def test_startup_random_routing_preserves_serving_graphs_and_rng(
         graphs.release_graphs()
         gc.collect()
         assert owner() is None
+
+
+@multi_gpu_test(num_gpus=8)
+def test_online_tp_dp_metadata_only_followers_do_not_wait_for_confidence_copies(
+    tmp_path,
+):
+    """Only TP leaders consume host confidences for the joint DP budget."""
+    mp.spawn(
+        _metadata_only_follower_worker,
+        args=(str(tmp_path / "metadata-only-store"),),
+        nprocs=8,
+        join=True,
+    )
+
+
+def _metadata_only_follower_worker(rank: int, store: str) -> None:
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="8")
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=4,
+            data_parallel_size=2,
+            data_parallel_rank=rank // 4,
+            enable_expert_parallel=True,
+            distributed_executor_backend="external_launcher",
+        )
+    )
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=8,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{store}",
+            backend="nccl",
+            timeout=timedelta(seconds=90),
+        )
+        initialize_model_parallel(4)
+        try:
+            states = RequestState(2, 16, 8, 3, 32, device)
+            req_ids = ["first", "second"]
+            for req_id in req_ids:
+                states.add_request(req_id, 1, [0], 1, 15)
+            states.apply_staged_writes()
+            buffers = InputBuffers(2, 8, device)
+            slots = np.array(
+                [states.req_id_to_index[r] for r in req_ids], dtype=np.intp
+            )
+            batch = replace(
+                InputBatch.make_dummy(2, 8, buffers, uniform_token_count=4),
+                req_ids=req_ids,
+                idx_mapping=torch.from_numpy(slots).to(device),
+                idx_mapping_np=slots,
+            )
+            manager = AdaptiveVerificationManager(
+                states,
+                buffers.query_start_loc,
+                1,
+                8,
+                enable_online_cost_feedback=True,
+                coordinate_moe_costs=True,
+            )
+            probabilities = torch.full((2, 3), 0.9, device=device)
+            for _ in range(2):
+                manager.record_confidences(probabilities, batch)
+            torch.accelerator.synchronize()
+            follower = not get_tp_group().is_first_rank
+            done = torch.Event(device=device)
+            if follower:
+                # Bounded GPU work keeps the old copy pending; query, not a
+                # wall-time threshold, proves that the host returned early.
+                torch.cuda._sleep(2_000_000_000)
+                done.record()
+            for _ in range(2):
+                manager.record_confidences(probabilities, batch)
+            blocked = torch.tensor(int(follower and done.query()))
+            torch.accelerator.synchronize()
+            dist.all_reduce(blocked, group=get_world_group().cpu_group)
+            assert blocked.item() == 0, "Metadata-only followers waited for D2H"
+
+            list(manager.batches_to_profile([4, 8]))
+            manager.set_initial_cost_curves(
+                [StepTimingSample(1.0, 1.0, 4, 1, True)] * 5
+                + [StepTimingSample(100.0, 1.0, 8, 2, True)] * 5,
+                online_samples=[
+                    StepTimingSample(1.0, 0.0, size, 1, True)
+                    for size in (4, 8)
+                    for _ in range(5)
+                ],
+            )
+            tokens = dict.fromkeys(req_ids, 4)
+            drafts = dict.fromkeys(req_ids, [0, 0, 0])
+            coordinator = manager.parallel_costs
+            assert coordinator is not None
+            for phase, (profiling, prefill) in enumerate(
+                ((False, False), (rank == 1, False), (False, rank >= 4))
+            ):
+                manager.coordinate_parallel_step(
+                    tokens,
+                    drafts,
+                    has_prefill=prefill,
+                    dummy_run=False,
+                    profiling=profiling,
+                )
+                assert coordinator.decision is not None
+                if phase == 0:
+                    assert coordinator.decision.budgets == (6, 6)
+                else:
+                    assert coordinator.decision.budgets is None
+            assert manager.get_num_tokens(tokens, drafts, has_prefill=True) == 4
+            cu_logits, query_lens, *_ = manager.reallocate_drafts(
+                req_ids, batch.idx_mapping
+            )
+            assert cu_logits.tolist() == [0, 2, 4]
+            assert query_lens[:3].tolist() == [0, 2, 4]
+        finally:
+            cleanup_dist_env_and_memory()
 
 
 def _check_online_moe_group(manager, rank, dp_rank, device):

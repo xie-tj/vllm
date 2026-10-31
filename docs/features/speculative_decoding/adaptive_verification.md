@@ -206,8 +206,10 @@ For MoE DP size greater than one, all ranks, including idle ranks, participate
 in one metadata/price reduction per decision. The driver alone learns runtime
 costs. Every rank derives identical
 budgets from the same published prices and acceptance data, without an extra
-object broadcast. Only DP leaders contribute acceptance vectors; TP followers
-contribute metadata votes. Sampler price tables are reused until observations
+object broadcast. Only DP leaders copy confidence histories to the host and
+contribute acceptance vectors; TP followers retain GPU confidence updates and
+metadata votes. Startup fallback budgets retain TP consensus. Sampler price
+tables are reused until observations
 change. Collected observations enter the following step's prices.
 Decisions and observations carry a step, cost version, profiler epoch, replica
 request counts and physical shapes. If any rank is profiling or a replica has

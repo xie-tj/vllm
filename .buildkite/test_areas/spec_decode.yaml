@@ -34,6 +34,18 @@ steps:
       depends_on:
       - image-build-amd
 
+- label: ":nvidia: (H100) Online AV TP4 DP2 metadata followers"
+  key: online-av-tp4-dp2-followers
+  device: h100
+  num_devices: 8
+  timeout_in_minutes: 15
+  source_file_dependencies:
+    - vllm/distributed/
+    - vllm/v1/worker/gpu/
+    - tests/v1/spec_decode/test_adaptive_verification.py
+  commands:
+    - pytest -v -s v1/spec_decode/test_adaptive_verification.py::test_online_tp_dp_metadata_only_followers_do_not_wait_for_confidence_copies
+
 - label: ":nvidia: (H100) Online AV TP and DP"
   key: online-av-tp-dp
   device: h100

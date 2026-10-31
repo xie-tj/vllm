@@ -388,6 +388,7 @@ class OnlineCostModel:
 class AdaptiveVerificationManager:
     parallel_costs: ParallelCostCoordinator | None = None
     enable_online_cost_feedback = False
+    _needs_host_confidences = True
 
     def __init__(
         self,
@@ -420,6 +421,9 @@ class AdaptiveVerificationManager:
             else None
         )
         self.synchronize_tp_decisions = get_tp_group().world_size > 1
+        self._needs_host_confidences = (
+            self.parallel_costs is None or get_tp_group().is_first_rank
+        )
         self.runtime_timing = (
             RuntimeTimingCollector()
             if enable_online_cost_feedback
@@ -633,7 +637,6 @@ class AdaptiveVerificationManager:
             )
         else:
             req_ids = list(num_tokens_per_req)
-            slots = [self.req_states.req_id_to_index[r] for r in req_ids]
             drafts = np.array([len(draft_tokens.get(r, ())) for r in req_ids])
             base = sum(num_tokens_per_req.values()) - int(drafts.sum())
             capacity = max(
@@ -644,14 +647,20 @@ class AdaptiveVerificationManager:
                     self._max_total_logits - len(req_ids) * self.num_bonus_tokens,
                 ),
             )
-            stale = self._stale_confidences[self._stale_idx].np[slots]
-            survival = np.cumprod(stale.astype(np.float64), axis=1)
-            valid = np.arange(self.num_speculative_steps)[None, :] < drafts[:, None]
-            scores = np.sort(survival[valid])[::-1][:capacity]
+            accepted = np.zeros(1)
+            if self._needs_host_confidences:
+                slots = [self.req_states.req_id_to_index[r] for r in req_ids]
+                stale = self._stale_confidences[self._stale_idx].np[slots]
+                survival = np.cumprod(stale.astype(np.float64), axis=1)
+                valid = np.arange(self.num_speculative_steps)[None, :] < drafts[:, None]
+                scores = np.sort(survival[valid])[::-1][:capacity]
+                accepted = np.concatenate(
+                    ([len(req_ids)], len(req_ids) + np.cumsum(scores))
+                )
             proposal = BudgetProposal(
                 len(req_ids),
                 base,
-                np.concatenate(([len(req_ids)], len(req_ids) + np.cumsum(scores))),
+                accepted,
                 not has_prefill and base <= self._cudagraph_limit and not skip_drafts,
             )
         self.parallel_costs.coordinate(
@@ -689,6 +698,12 @@ class AdaptiveVerificationManager:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
         num_reqs = input_batch.num_reqs
+        if not self._needs_host_confidences:
+            self._confidence_probs[input_batch.idx_mapping] = confidence_probs[
+                :num_reqs
+            ]
+            self._pending_resets.clear()
+            return None
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()

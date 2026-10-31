@@ -1717,6 +1717,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        top_tokens = getattr(self.model, "get_top_tokens", None)
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.enable_vocab_parallel_sampling
+            and self.vllm_config.lora_config is None
+            and self.batch_sharder is None
+            and grammar_output is None
+            and not input_batch.has_structured_output_reqs
+            and self.model_state.num_new_sampled_tokens_per_step == 1
+            and top_tokens is not None
+            and self.rejection_sampler is not None
+            and self.rejection_sampler.can_sample_greedy_ids(input_batch)
+        ):
+            target_ids = top_tokens(hidden_states[input_batch.logits_indices])
+            output = self.rejection_sampler.sample_greedy_ids(target_ids, input_batch)
+            return output, output.num_sampled, output.num_rejected
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:

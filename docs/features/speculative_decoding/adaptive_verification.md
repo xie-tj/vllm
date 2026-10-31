@@ -245,3 +245,21 @@ must not become the serving cost estimate.
 When profiling starts or stops, active and pending feedback samples are discarded
 so measurements spanning a profiler session cannot enter the cost model. Pending
 GPU work still completes before its timing markers are released.
+
+Set `"enable_vocab_parallel_sampling": true` in `--speculative-config` to reduce
+vocabulary communication for AV on model runner V2. It defaults to false and is
+independent of online cost calibration. Qwen3.5 MTP greedy drafts exchange
+vocabulary-block
+statistics instead of full logits. Blocks retain their original 4096-column
+boundaries and reduction order, including blocks crossing a TP shard, so the
+acceptance estimator receives the same features. Pure greedy target requests
+use the model's existing TP argmax reduction and prefix verification.
+
+The target optimization falls back to native sampling for logits processors,
+constraints, logprobs, stochastic sampling, tracing, watermarking, nonstandard
+verification, LoRA and batch-sharded sampling. Unsupported model APIs also keep
+native sampling. The option requires AV and leaves existing
+backend, graph, cache, JIT and local-argmax settings unchanged. It does not alter
+startup routing, cost calibration, or driver-only runtime timing. Compare both
+optimized AV and optimized AV with feedback against a native AV control using
+the same proposal limit to distinguish sampling gains from feedback gains.

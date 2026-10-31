@@ -34,17 +34,26 @@ steps:
       depends_on:
       - image-build-amd
 
-- label: ":nvidia: (H100) Online AV TP4 DP2 metadata followers"
+- label: ":nvidia: (H100) AV TP4 DP2 followers and vocabulary sampling"
   key: online-av-tp4-dp2-followers
   device: h100
   num_devices: 8
-  timeout_in_minutes: 15
+  timeout_in_minutes: 30
   source_file_dependencies:
+    - vllm/config/speculative.py
     - vllm/distributed/
+    - vllm/model_executor/models/qwen3_5.py
+    - vllm/model_executor/models/qwen3_5_mtp.py
     - vllm/v1/worker/gpu/
     - tests/v1/spec_decode/test_adaptive_verification.py
+    - tests/v1/spec_decode/test_acceptance_estimator.py
+    - tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
   commands:
-    - pytest -v -s v1/spec_decode/test_adaptive_verification.py::test_online_tp_dp_confidence_copies_do_not_block
+    - >-
+      pytest -v -s
+      v1/spec_decode/test_adaptive_verification.py::test_online_tp_dp_confidence_copies_do_not_block
+      v1/spec_decode/test_acceptance_estimator.py::test_vocab_block_stats_match_full_logits
+    - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_vocab_parallel_sampling_matches_native_tp4_dp2_ep
 
 - label: ":nvidia: (H100) Online AV TP and DP"
   key: online-av-tp-dp
@@ -59,6 +68,8 @@ steps:
     - vllm/v1/worker/gpu/
     - vllm/v1/worker/gpu_worker.py
     - tests/v1/spec_decode/test_adaptive_verification.py
+    - tests/v1/spec_decode/test_rejection_sampler_utils.py
+    - tests/v1/worker/test_gpu_sampler_flags.py
     - tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
   commands:
     - pytest -v -s v1/spec_decode/test_adaptive_verification.py -k online_tp_dp
@@ -69,6 +80,8 @@ steps:
       pytest -v -s
       v1/worker/test_gpu_input_batch_v2.py
       v1/worker/test_gpu_dp_utils.py
+      v1/worker/test_gpu_sampler_flags.py
+      v1/spec_decode/test_rejection_sampler_utils.py
     - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_moe_mtp_dp_survives_idle_transitions
 
 - label: ":nvidia: (H200 MIG 35GB) Spec Decode Eagle 1: DeepSeek + Qwen"

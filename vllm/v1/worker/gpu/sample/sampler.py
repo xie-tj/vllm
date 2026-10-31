@@ -131,6 +131,22 @@ class Sampler:
         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
         return num_logprobs, max_token_ids
 
+    def can_sample_greedy_ids(self, input_batch: InputBatch) -> bool:
+        """Whether logits are used only for an unprocessed greedy choice."""
+        idx = input_batch.idx_mapping_np
+        return bool(
+            type(self) is Sampler
+            and len(input_batch.req_ids) == len(idx) > 0
+            and all(r in self.req_states.req_id_to_index for r in input_batch.req_ids)
+            and np.all(idx >= 0)
+            and not self.compute_nans
+            and not self.return_sampling_mask
+            and self.trace_replay_state is None
+            and not np.any(self.needs_logits_processing[idx])
+            and np.all(self.sampling_states.temperature.np[idx] == 0.0)
+            and self.get_logprobs_dims(idx) is None
+        )
+
     def __call__(
         self,
         logits: torch.Tensor,

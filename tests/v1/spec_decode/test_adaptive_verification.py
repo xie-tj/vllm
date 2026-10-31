@@ -624,6 +624,22 @@ def test_online_cost_feedback_requires_adaptive_verification():
         SpeculativeConfig(enable_online_cost_feedback=True)
 
 
+def test_vocab_parallel_sampling_requires_av_and_is_independent_of_cost_feedback():
+    with pytest.raises(ValueError, match="requires enable_adaptive_verification=True"):
+        SpeculativeConfig(enable_vocab_parallel_sampling=True)
+    config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=3,
+        enable_adaptive_verification=True,
+        enable_vocab_parallel_sampling=True,
+    )
+    assert config.enable_vocab_parallel_sampling
+    assert not config.enable_online_cost_feedback
+    assert not SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3
+    ).enable_vocab_parallel_sampling
+
+
 def test_online_cost_feedback_accepts_tensor_and_data_parallel_configuration():
     config = SpeculativeConfig(
         method="ngram",

@@ -4,6 +4,8 @@
 import asyncio
 import json
 import os
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -20,6 +22,146 @@ from ...utils import (
     get_test_prompts,
 )
 from .._correctness import check_mtp_correctness
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+class VocabSamplingTestExtension:
+    model_runner: "GPUModelRunner"
+
+    def full_verification_for_equivalence(self):
+        runner = self.model_runner
+        assert runner.adaptive_verification is not None
+        assert runner.speculator is not None
+        # Keep identical model shapes across both servers. These artificial
+        # costs serve equivalence testing only, never performance measurement.
+        runner.adaptive_verification.set_cost_curves(
+            [(1, 0.0), (128, 0.0)],
+            [(n, 1.0 / n) for n in range(1, 513)],
+        )
+        config = runner.vllm_config
+        assert config.speculative_config is not None
+        return {
+            "vocab_statistics": runner.speculator.use_vocab_statistics,
+            "local_argmax": config.speculative_config.use_local_argmax_reduction,
+            "batch_sharding": runner.batch_sharder is not None,
+            "prefix_caching": config.cache_config.enable_prefix_caching,
+            "chunked_prefill": config.scheduler_config.enable_chunked_prefill,
+            "jit_warmup": config.kernel_config.enable_jit_warmup,
+            "moe_backend": config.kernel_config.moe_backend,
+        }
+
+
+@pytest.mark.distributed(num_gpus=8)
+@pytest.mark.asyncio
+async def test_vocab_parallel_sampling_matches_native_tp4_dp2_ep(monkeypatch):
+    """Real greedy outputs and constrained/logprob fallbacks retain native AV."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model = os.environ.get("VLLM_TEST_MOE_MTP_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
+    results, configurations = [], []
+    for optimized in (False, True):
+        args = [
+            "--served-model-name",
+            "vocab-av",
+            "--tensor-parallel-size",
+            "4",
+            "--data-parallel-size",
+            "2",
+            "--data-parallel-size-local",
+            "2",
+            "--enable-expert-parallel",
+            "--distributed-executor-backend",
+            "mp",
+            "--language-model-only",
+            "--max-model-len",
+            "4096",
+            "--max-num-batched-tokens",
+            "512",
+            "--max-num-seqs",
+            "128",
+            "--gpu-memory-utilization",
+            "0.80",
+            "--worker-extension-cls",
+            f"{__name__}.VocabSamplingTestExtension",
+            "--speculative-config",
+            json.dumps(
+                {
+                    "method": "mtp",
+                    "num_speculative_tokens": 3,
+                    "enable_adaptive_verification": True,
+                    "enable_vocab_parallel_sampling": optimized,
+                }
+            ),
+        ]
+        with RemoteOpenAIServer(
+            model,
+            args,
+            env_dict={
+                "VLLM_USE_V2_MODEL_RUNNER": "1",
+                "VLLM_SERVER_DEV_MODE": "1",
+                "PYTHONPATH": os.pathsep.join(
+                    [
+                        str(Path(__file__).resolve().parents[6]),
+                        os.environ.get("PYTHONPATH", ""),
+                    ]
+                ),
+            },
+            max_wait_seconds=900,
+        ) as server:
+            async with server.get_async_client() as client, httpx.AsyncClient() as rpc:
+                response = await rpc.post(
+                    server.url_for("collective_rpc"),
+                    json={"method": "full_verification_for_equivalence"},
+                    timeout=120,
+                )
+                response.raise_for_status()
+                states = response.json()["results"]
+                states = [
+                    s
+                    for row in states
+                    for s in (row if isinstance(row, list) else [row])
+                ]
+                assert all(s.pop("vocab_statistics") == optimized for s in states)
+                configurations.append(states)
+                constrained = await client.completions.create(
+                    model="vocab-av",
+                    prompt="Continue.",
+                    temperature=0,
+                    max_tokens=16,
+                    extra_body={
+                        "ignore_eos": True,
+                        "allowed_token_ids": [42],
+                        "return_token_ids": True,
+                    },
+                )
+                assert constrained.choices[0].token_ids == [42] * 16
+                tokens = []
+                for prompt in (
+                    "The number after one is",
+                    "Write the weekdays in order.",
+                ):
+                    output = await client.completions.create(
+                        model="vocab-av",
+                        prompt=prompt,
+                        temperature=0,
+                        max_tokens=32,
+                        extra_body={"ignore_eos": True, "return_token_ids": True},
+                    )
+                    assert len(output.choices[0].token_ids) == 32
+                    tokens.append(output.choices[0].token_ids)
+                results.append(tokens)
+                scored = await client.completions.create(
+                    model="vocab-av",
+                    prompt="Continue.",
+                    temperature=0,
+                    max_tokens=4,
+                    logprobs=0,
+                    extra_body={"ignore_eos": True},
+                )
+                assert len(scored.choices[0].logprobs.token_logprobs) == 4
+    assert configurations[0] == configurations[1]
+    assert results[0] == results[1]
 
 
 @pytest.mark.parametrize(

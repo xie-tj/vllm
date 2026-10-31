@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 # The feature is a log-odds, log(q / (1 - q)), which a row carrying all of its
 # mass on one token sends to infinity. Clamp it symmetrically.
 _MAX_LOG_ODDS = 40.0
+VOCAB_BLOCK_SIZE = 4096
 
 # Cold-start coefficients: the median slope and intercept fitted online across
 # DeepSeek-V4-Flash, Muse-Glimmer-30B, MiMo-V2.5-Pro, Inkling and Kimi-K2.5.
@@ -469,27 +470,23 @@ class OnlineAcceptanceEstimator:
         confidence_probs: torch.Tensor,
         temperature: torch.Tensor,
     ) -> None:
-        num_tokens, vocab_size = logits.shape
-        VOCAB_BLOCK_SIZE = 4096
-        num_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK_SIZE)
-        local_max = torch.empty(
-            num_tokens, num_blocks, dtype=torch.float32, device=self.device
+        local_max, local_sumexp = compute_acceptance_partials(
+            logits, idx_mapping, temperature
         )
-        local_sumexp = torch.empty_like(local_max)
-        _local_max_sumexp_kernel[(num_tokens, num_blocks)](
-            local_max,
-            local_max.stride(0),
-            local_sumexp,
-            local_sumexp.stride(0),
-            logits,
-            logits.stride(0),
-            idx_mapping,
-            idx_mapping.stride(0),
-            temperature,
-            num_tokens,
-            vocab_size,
-            BLOCK_SIZE=VOCAB_BLOCK_SIZE,
+        self.predict_from_partials(
+            local_max, local_sumexp, idx_mapping, draft_step, confidence_probs
         )
+
+    def predict_from_partials(
+        self,
+        local_max: torch.Tensor,
+        local_sumexp: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        draft_step: torch.Tensor,
+        confidence_probs: torch.Tensor,
+    ) -> None:
+        """Consume the same ordered vocabulary blocks as ``predict``."""
+        num_tokens, num_blocks = local_max.shape
         _predict_kernel[(num_tokens,)](
             self.features,
             self.features.stride(0),
@@ -513,3 +510,30 @@ class OnlineAcceptanceEstimator:
             MAX_LOG_ODDS=_MAX_LOG_ODDS,
             PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
         )
+
+
+def compute_acceptance_partials(
+    logits: torch.Tensor, idx_mapping: torch.Tensor, temperature: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Max and sum-exp of each original, ordered 4096-column vocabulary block."""
+    num_tokens, vocab_size = logits.shape
+    num_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK_SIZE)
+    local_max = torch.empty(
+        num_tokens, num_blocks, dtype=torch.float32, device=logits.device
+    )
+    local_sumexp = torch.empty_like(local_max)
+    _local_max_sumexp_kernel[(num_tokens, num_blocks)](
+        local_max,
+        local_max.stride(0),
+        local_sumexp,
+        local_sumexp.stride(0),
+        logits,
+        logits.stride(0),
+        idx_mapping,
+        idx_mapping.stride(0),
+        temperature,
+        num_tokens,
+        vocab_size,
+        BLOCK_SIZE=VOCAB_BLOCK_SIZE,
+    )
+    return local_max, local_sumexp

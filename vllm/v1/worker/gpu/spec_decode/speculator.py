@@ -41,6 +41,7 @@ from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
 from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
+from vllm.v1.worker.gpu.spec_decode.vocab_stats import gather_draft_statistics
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
@@ -186,6 +187,11 @@ class DraftModelSpeculator(BaseSpeculator):
             self.speculative_config.enable_adaptive_verification
         )
         self.use_acceptance_estimator = self.enable_adaptive_verification
+        self.use_vocab_statistics = (
+            self.speculative_config.enable_vocab_parallel_sampling
+            and self.speculative_config.method == "mtp"
+            and vllm_config.lora_config is None
+        )
         self.acceptance_estimator: OnlineAcceptanceEstimator | None = None
 
         # Pre-temperature logits, cached from the previous decode step.
@@ -536,6 +542,22 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is None and self.use_local_argmax_reduction:
             return self.get_draft_top_tokens(hidden_states, spec_step_idx)
+
+        compute_local = getattr(self.model, "compute_logits_local", None)
+        if (
+            self.use_vocab_statistics
+            and draft_logits is None
+            and self.acceptance_estimator is not None
+            and compute_local is not None
+            and getattr(self.model, "draft_id_to_target_id", None) is None
+        ):
+            sampled, maxima, sums = gather_draft_statistics(
+                compute_local(hidden_states), idx_mapping, temperature, self.vocab_size
+            )
+            self.acceptance_estimator.predict_from_partials(
+                maxima, sums, idx_mapping, draft_step, self.draft_token_confidence_probs
+            )
+            return sampled
 
         logits = self.compute_draft_logits(hidden_states, spec_step_idx)
         if draft_logits is not None and self.draft_watermarker is not None:

@@ -35,6 +35,32 @@ MAX_CHUNK_BYTES = 2**30  # 1GB
 _FP32_BYTES = 4
 
 
+@triton.jit
+def _greedy_ids_kernel(
+    output,
+    counts,
+    target,
+    draft_inputs,
+    cu_logits,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    start = tl.load(cu_logits + req)
+    length = tl.load(cu_logits + req + 1) - start
+    offsets = tl.arange(0, BLOCK)
+    draft_count = tl.maximum(length - 1, 0)
+    target_ids = tl.load(target + start + offsets, mask=offsets < length, other=-1)
+    proposed = tl.load(
+        draft_inputs + start + offsets + 1, mask=offsets < draft_count, other=-1
+    )
+    rejected = (offsets < draft_count) & ((proposed < 0) | (proposed != target_ids))
+    accepted = tl.min(tl.where(rejected, offsets, draft_count), 0)
+    tokens = tl.where((offsets <= accepted) & (offsets < length), target_ids, -1)
+    tl.store(output + req * WIDTH + offsets, tokens, mask=offsets < WIDTH)
+    tl.store(counts + req, tl.where(length > 0, accepted + 1, 0))
+
+
 def get_max_chunk_logits(vocab_size: int) -> int:
     """Largest number of logits rows one verification chunk may hold."""
     return max(1, MAX_CHUNK_BYTES // (vocab_size * _FP32_BYTES))
@@ -223,6 +249,56 @@ class RejectionSampler:
             logits_mode=self.sampler.logprobs_mode
             in ("raw_logits", "processed_logits"),
         )
+
+    def can_sample_greedy_ids(self, input_batch: InputBatch) -> bool:
+        return (
+            self.synthetic_conditional_rates is None
+            and not self.use_block_verification
+            and self.fly_window_size == 0
+            and self.watermark_key is None
+            and self.sampler.can_sample_greedy_ids(input_batch)
+        )
+
+    def sample_greedy_ids(
+        self, target_ids: torch.Tensor, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """Standard one-bonus greedy verification, without a vocabulary tensor."""
+        assert self.num_speculative_steps is not None
+        drafts, _ = gather_draft_sampled(
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        width = (
+            self.num_speculative_steps + 1 if input_batch.num_draft_tokens > 0 else 1
+        )
+        sampled = torch.empty(
+            input_batch.num_reqs, width, dtype=torch.int64, device=target_ids.device
+        )
+        counts = torch.empty(
+            input_batch.num_reqs, dtype=torch.int32, device=target_ids.device
+        )
+        _greedy_ids_kernel[(input_batch.num_reqs,)](
+            sampled,
+            counts,
+            target_ids,
+            drafts,
+            input_batch.cu_num_logits,
+            WIDTH=width,
+            BLOCK=triton.next_power_of_2(width),
+            num_warps=1,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            counts,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(sampled, None, None, num_sampled, num_rejected)
 
     def _watermarking_kwargs(
         self,

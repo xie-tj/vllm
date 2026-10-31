@@ -9,15 +9,30 @@ to another request -- so it is asserted here rather than left to acceptance
 metrics to hint at.
 """
 
+import os
+from datetime import timedelta
+
 import pytest
 import torch
+import torch.multiprocessing as mp
 
+from tests.utils import multi_gpu_test
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.distributed import (
+    cleanup_dist_env_and_memory,
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from vllm.distributed.parallel_state import graph_capture
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
     _accumulate_kernel,
     _refit_kernel,
+    compute_acceptance_partials,
 )
+from vllm.v1.worker.gpu.spec_decode.vocab_stats import gather_draft_statistics
 
 pytest.importorskip("triton")
 if not current_platform.is_cuda_alike() and not current_platform.is_xpu():
@@ -28,6 +43,112 @@ if not current_platform.is_cuda_alike() and not current_platform.is_xpu():
 MAX_NUM_REQS = 16
 NUM_STEPS = 4
 VOCAB_SIZE = 2048
+
+
+@multi_gpu_test(num_gpus=8)
+def test_vocab_block_stats_match_full_logits(tmp_path):
+    """TP sharding must preserve ids and exact block reductions, including halos."""
+    mp.spawn(
+        _vocab_stats_worker, args=(str(tmp_path / "vocab-store"),), nprocs=8, join=True
+    )
+
+
+def _vocab_stats_worker(rank, store):
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="8")
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=4,
+            data_parallel_size=2,
+            data_parallel_rank=rank // 4,
+            enable_expert_parallel=True,
+            distributed_executor_backend="external_launcher",
+        )
+    )
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=8,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{store}",
+            backend="nccl",
+            timeout=timedelta(seconds=90),
+        )
+        initialize_model_parallel(4)
+        try:
+            tp = get_tp_group()
+            temperatures = torch.tensor([0.0, 0.7, 1.3] * 27, device=device)
+            step = torch.tensor(2, device=device)
+
+            def run(local_logits, row_mapping, estimator, probabilities, size):
+                ids, maxima, sums = gather_draft_statistics(
+                    local_logits, row_mapping, temperatures, size
+                )
+                estimator.predict_from_partials(
+                    maxima, sums, row_mapping, step, probabilities
+                )
+                return ids, maxima, sums
+
+            for dtype in (torch.bfloat16, torch.float32):
+                for width in (4224, 8256, 62080):
+                    vocab = width * 4 - 17
+                    for rows in (1, 7, 64):
+                        torch.manual_seed(42 + rank)
+                        local = torch.randn(rows, width, dtype=dtype, device=device)
+                        local[0].zero_()
+                        if rows > 1:
+                            local[1].fill_(-2)
+                            if tp.rank_in_group == 0:
+                                local[1, 7] = 30
+                        if rows > 2:
+                            local[2].fill_(-float("inf"))
+                        if rows > 3 and tp.rank_in_group == 1:
+                            local[3, 0] = float("nan")
+                        if tp.rank_in_group == 3:
+                            local[:, -17:].fill_(1000)
+                        mapping = (torch.arange(rows, device=device) * 7 + 3) % 80
+                        if rows > 1:
+                            mapping[-1] = -1
+                        full = tp.all_gather(local, dim=-1)[:, :vocab]
+                        expected_max, expected_sum = compute_acceptance_partials(
+                            full, mapping, temperatures
+                        )
+                        expected = OnlineAcceptanceEstimator(80, NUM_STEPS, device)
+                        actual = OnlineAcceptanceEstimator(80, NUM_STEPS, device)
+                        expected_probs = torch.full(
+                            (rows, NUM_STEPS), -7.0, device=device
+                        )
+                        actual_probs = torch.full_like(expected_probs, -7.0)
+                        expected.predict(
+                            full, mapping, step, expected_probs, temperatures
+                        )
+
+                        ids, maxima, sums = run(
+                            local, mapping, actual, actual_probs, vocab
+                        )
+                        if rows == 7 and width == 62080:
+                            with graph_capture(device) as context:
+                                graph = torch.cuda.CUDAGraph()
+                                with torch.cuda.graph(graph, stream=context.stream):
+                                    ids, maxima, sums = run(
+                                        local, mapping, actual, actual_probs, vocab
+                                    )
+                            graph.replay()
+                            torch.accelerator.synchronize()
+                        assert torch.equal(ids, full.argmax(-1))
+                        for left, right in (
+                            (maxima, expected_max),
+                            (sums, expected_sum),
+                            (actual.features, expected.features),
+                            (actual.predictions, expected.predictions),
+                            (actual_probs, expected_probs),
+                        ):
+                            torch.testing.assert_close(
+                                left, right, rtol=0, atol=0, equal_nan=True
+                            )
+        finally:
+            cleanup_dist_env_and_memory()
 
 
 def _make_estimator(device: torch.device) -> OnlineAcceptanceEstimator:

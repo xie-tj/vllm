@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,7 +13,9 @@ pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for sampler flag tests", allow_module_level=True)
 
+from vllm.config import VllmConfig
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.sample.logits_processor import (
     LogitsContext,
     LogitsProcessor,
@@ -22,6 +25,46 @@ from vllm.v1.worker.gpu.states import RequestState
 
 DEVICE = torch.device("cuda")
 VOCAB_SIZE = 128
+
+
+@pytest.mark.parametrize(
+    ("params", "eligible"),
+    [
+        (SamplingParams(temperature=0), True),
+        (SamplingParams(temperature=0.7), False),
+        (SamplingParams(temperature=0, logprobs=0), False),
+        (SamplingParams(temperature=0, logprob_token_ids=[4]), False),
+        (SamplingParams(temperature=0, allowed_token_ids=[42]), False),
+        (SamplingParams(temperature=0, min_tokens=2, stop_token_ids=[9]), False),
+        (SamplingParams(temperature=0, frequency_penalty=0.1), False),
+        (SamplingParams(temperature=0, logit_bias={1: 1.0}), False),
+        (SamplingParams(temperature=0, _bad_words_token_ids=[[1]]), False),
+    ],
+)
+def test_greedy_id_eligibility_preserves_sampling_features(params, eligible):
+    states = RequestState(4, 64, 16, 3, VOCAB_SIZE, DEVICE)
+    sampler = Sampler(VllmConfig(), 4, VOCAB_SIZE, DEVICE, states)
+    batch = InputBatch.make_dummy(1, 1, InputBuffers(4, 16, DEVICE))
+    assert not sampler.can_sample_greedy_ids(batch)
+    states.add_request("active", 1, [1], 0, 16)
+    slot = states.req_id_to_index["active"]
+    batch = replace(
+        batch,
+        req_ids=["active"],
+        idx_mapping_np=np.array([slot], dtype=np.intp),
+        idx_mapping=torch.tensor([slot], device=DEVICE),
+    )
+    sampler.add_request(slot, params)
+    sampler.apply_staged_writes()
+    assert sampler.can_sample_greedy_ids(batch) == eligible
+
+    # An allocated allowlist/bias buffer must not disable later plain requests.
+    sampler.add_request(slot, SamplingParams(temperature=0))
+    sampler.apply_staged_writes()
+    assert sampler.can_sample_greedy_ids(batch)
+    assert not sampler.can_sample_greedy_ids(
+        replace(batch, idx_mapping_np=np.array([-1], dtype=np.intp))
+    )
 
 
 class MockReasoningConfig:

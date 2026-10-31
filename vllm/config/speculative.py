@@ -623,6 +623,13 @@ class SpeculativeConfig:
     Disabled by default. FULL decode uses forward and runtime sampler estimates;
     unsupported paths retain the startup-profiled costs."""
 
+    enable_vocab_parallel_sampling: bool = False
+    """Use TP vocabulary block statistics for greedy AV drafts and a direct
+    greedy target path when sampling needs no logits processing or logprobs.
+    Requires adaptive verification on model runner V2. Supported model APIs
+    avoid materializing full-vocabulary logits; other paths retain native
+    sampling. Independent of online cost calibration and disabled by default."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -1298,6 +1305,14 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        if (
+            self.enable_vocab_parallel_sampling
+            and not self.enable_adaptive_verification
+        ):
+            raise ValueError(
+                "enable_vocab_parallel_sampling requires "
+                "enable_adaptive_verification=True."
+            )
         if self.enable_online_cost_feedback and not self.enable_adaptive_verification:
             raise ValueError(
                 "enable_online_cost_feedback requires "

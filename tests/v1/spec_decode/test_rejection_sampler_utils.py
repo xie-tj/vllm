@@ -2,26 +2,164 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
+from vllm.config import SpeculativeConfig, VllmConfig
+from vllm.sampling_params import SamplingParams
+from vllm.triton_utils import triton
 from vllm.v1.spec_decode.fly import compute_fly_entropy
 from vllm.v1.watermarking import GumbelWatermarker
 from vllm.v1.watermarking.spec_decode import watermarked_rejection_sample
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
+    _greedy_ids_kernel,
     gather_draft_sampled,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
+from vllm.v1.worker.gpu.states import RequestState
 
 VOCAB_SIZE = 4096
+
+
+@pytest.mark.parametrize("steps", [3, 5, 7])
+def test_greedy_target_ids_preserve_native_prefix_verification(steps):
+    """All-match, early rejection, placeholders and short blocks keep native ids."""
+    device = "cuda"
+    lengths = [steps + 1, steps + 1, 3, steps + 1, 1, 2]
+    offsets = [0]
+    inputs, targets = [], []
+    expected_counts = [steps + 1, 2, 1, 1, 1, 2]
+    expected_rows = []
+    for req, length in enumerate(lengths):
+        tokens = [100 + req * 20 + i for i in range(length)]
+        predicted = tokens[1:] + [80 + req]
+        if req == 1:
+            predicted[1] = 99
+        elif req == 2:
+            predicted[0] = 99
+        elif req == 3:
+            tokens[1] = -1
+            predicted[0] = 77
+        inputs.extend(tokens)
+        targets.extend(predicted)
+        expected_rows.append(
+            predicted[: expected_counts[req]]
+            + [-1] * (steps + 1 - expected_counts[req])
+        )
+        offsets.append(offsets[-1] + length)
+    cu = torch.tensor(offsets, device=device, dtype=torch.int32)
+    target_ids = torch.tensor(targets, device=device, dtype=torch.int64)
+    draft_inputs = torch.tensor(inputs, device=device, dtype=torch.int64)
+    logits = torch.full((len(targets), VOCAB_SIZE), -10.0, device=device)
+    logits.scatter_(1, target_ids[:, None], 10.0)
+    mapping = torch.tensor([7, 1, 8, 3, 6, 2], device=device, dtype=torch.int32)
+    lengths_gpu = torch.tensor(lengths, device=device)
+    expanded_mapping = mapping.repeat_interleave(lengths_gpu)
+    local_pos = torch.cat([torch.arange(n, device=device) for n in lengths]).int()
+    native, native_counts = rejection_sample(
+        logits,
+        None,
+        draft_inputs,
+        cu,
+        torch.arange(len(targets), device=device, dtype=torch.int32),
+        mapping,
+        expanded_mapping,
+        local_pos,
+        torch.zeros(10, device=device),
+        torch.arange(10, device=device, dtype=torch.int64),
+        steps,
+    )
+    actual = torch.empty_like(native)
+    counts = torch.empty_like(native_counts)
+    _greedy_ids_kernel[(len(lengths),)](
+        actual,
+        counts,
+        target_ids,
+        draft_inputs,
+        cu,
+        WIDTH=steps + 1,
+        BLOCK=triton.next_power_of_2(steps + 1),
+        num_warps=1,
+    )
+    assert torch.equal(counts, native_counts)
+    valid = torch.arange(steps + 1, device=device)[None, :] < counts[:, None]
+    # Native rejection sampling leaves columns after num_sampled uninitialized.
+    assert torch.equal(actual[valid], native[valid])
+    assert actual.tolist() == expected_rows
+    assert counts.tolist() == expected_counts
+
+
+@pytest.mark.parametrize("with_drafts", [False, True])
+def test_greedy_target_ids_preserve_prefill_and_rollback_counts(with_drafts):
+    device = torch.device("cuda")
+    states = RequestState(4, 64, 32, 3, VOCAB_SIZE, device)
+    sampler = Sampler(VllmConfig(), 4, VOCAB_SIZE, device, states)
+    req_ids = ["decode", "chunk", "prefill"]
+    for req, prompt_len in zip(req_ids, [1, 8, 1]):
+        states.add_request(req, prompt_len, [1] * prompt_len, 0, 16)
+        sampler.add_request(states.req_id_to_index[req], SamplingParams(temperature=0))
+    states.apply_staged_writes()
+    sampler.apply_staged_writes()
+    length = 4 if with_drafts else 1
+    lengths = [length, length, 1]
+    offsets = np.array([0, length, 2 * length, 2 * length + 1], dtype=np.int32)
+    slots_np = np.array([states.req_id_to_index[r] for r in req_ids], dtype=np.intp)
+    slots = torch.from_numpy(slots_np).to(device)
+    num_logits = int(offsets[-1])
+    inputs = torch.arange(100, 100 + num_logits, device=device, dtype=torch.int32)
+    target_ids = (inputs + 1).long()
+    logits = torch.full((num_logits, VOCAB_SIZE), -10.0, device=device)
+    logits.scatter_(1, target_ids[:, None], 10.0)
+    seq_lens = torch.tensor([10 + length, length, 1], device=device, dtype=torch.int32)
+    batch = replace(
+        InputBatch.make_dummy(3, num_logits, InputBuffers(4, 32, device)),
+        req_ids=req_ids,
+        idx_mapping=slots,
+        idx_mapping_np=slots_np,
+        expanded_idx_mapping=slots.repeat_interleave(
+            torch.tensor(lengths, device=device)
+        ),
+        expanded_local_pos=torch.cat(
+            [torch.arange(n, device=device) for n in lengths]
+        ).int(),
+        num_draft_tokens=num_logits - 3,
+        cu_num_logits=torch.from_numpy(offsets).to(device),
+        cu_num_logits_np=offsets,
+        input_ids=inputs,
+        positions=torch.tensor(
+            [*range(10, 10 + length), *range(length), 0], device=device
+        ),
+        logits_indices=torch.arange(num_logits, device=device),
+        seq_lens=seq_lens,
+        seq_lens_cpu_upper_bound=seq_lens.cpu(),
+    )
+    rejection = RejectionSampler(
+        sampler, SpeculativeConfig(method="ngram", num_speculative_tokens=3), device
+    )
+    expected = rejection(logits, batch, None) if with_drafts else sampler(logits, batch)
+    actual = rejection.sample_greedy_ids(target_ids, batch)
+    assert torch.equal(actual.num_sampled, expected.num_sampled)
+    assert torch.equal(actual.num_rejected, expected.num_rejected)
+    valid = (
+        torch.arange(actual.sampled_token_ids.shape[1], device=device)[None, :]
+        < actual.num_sampled[:, None]
+    )
+    assert torch.equal(
+        actual.sampled_token_ids[valid], expected.sampled_token_ids[valid]
+    )
+
 
 # Skip if no CUDA - Triton kernel requires GPU
 pytest.importorskip("triton")

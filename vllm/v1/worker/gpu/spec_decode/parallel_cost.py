@@ -67,15 +67,23 @@ class ParallelCostCoordinator:
         self.group = get_ep_group()
         self.tp_size = get_tp_group().world_size
         self.dp_size = self.group.world_size // self.tp_size
+        assert self.dp_size > 1
         self.max_num_tokens = max_num_tokens
         self.step_id = 0
         self.epoch = 0
         self.cost_version = 0
         self._model_version = 0
+        metadata_size = self.group.world_size * 6
         self._sync = torch.zeros(
-            self.group.world_size + 2, max_num_tokens + 7, dtype=torch.float64
+            metadata_size + (self.dp_size + 2) * (max_num_tokens + 1) + 1,
+            dtype=torch.float64,
         )
-        self._values = self._sync.numpy()
+        self._packed = self._sync.numpy()
+        self._metadata = self._packed[:metadata_size].reshape(-1, 6)
+        # TP followers vote on metadata, but do not need acceptance-vector rows.
+        self._values = self._packed[metadata_size:-1].reshape(
+            self.dp_size + 2, max_num_tokens + 1
+        )
         self._profile_mask: tuple[bool, ...] = ()
         self.decision: ParallelCostDecision | None = None
         self.elapsed_ms = 0.0
@@ -95,8 +103,9 @@ class ParallelCostCoordinator:
         self.step_id += 1
         rank = self.group.rank_in_group
         values = self._values
-        values.fill(0)
-        values[rank, :6] = [
+        metadata = self._metadata
+        self._packed.fill(0)
+        metadata[rank] = [
             self.step_id,
             profiling,
             proposal.eligible,
@@ -105,17 +114,16 @@ class ParallelCostCoordinator:
             len(proposal.accepted),
         ]
         if get_tp_group().is_first_rank:
-            values[rank, 6 : 6 + len(proposal.accepted)] = proposal.accepted
+            values[rank // self.tp_size, : len(proposal.accepted)] = proposal.accepted
         if self.group.is_first_rank:
             assert model is not None and timing is not None
             values[-2, model.graph_sizes] = model.get_forward_costs()
             sampler = model.get_sampler_costs()
             values[-1, : len(sampler)] = sampler
-            values[-1, -1] = self._model_version
+            self._packed[-1] = self._model_version
         self.group.cpu_all_reduce_(self._sync)
-        metadata = values[: self.group.world_size]
         assert bool(np.all(metadata[:, 0] == self.step_id)), "MoE cost step mismatch"
-        self.cost_version = int(values[-1, -1])
+        self.cost_version = int(self._packed[-1])
         profile_mask = tuple(bool(v) for v in metadata[:, 1])
         if profile_mask != self._profile_mask:
             self.epoch += 1
@@ -127,10 +135,10 @@ class ParallelCostCoordinator:
             BudgetProposal(
                 int(row[3]),
                 int(row[4]),
-                row[6 : 6 + int(row[5])],
+                values[dp_rank, : int(row[5])],
                 bool(row[2]),
             )
-            for row in leaders
+            for dp_rank, row in enumerate(leaders)
         ]
         # Followers may enter profiling independently; every vote counts.
         eligible = (

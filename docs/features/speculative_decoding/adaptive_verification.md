@@ -86,7 +86,12 @@ configuration, enable it with:
 
 The feedback uses a DeepInfer-style robust estimator. Its captured forward
 curve is measured separately with no prior KV history, using five startup
-measurements per FULL physical token size. It discards the
+measurements per FULL physical token size. Shapes are measured largest first,
+with one untimed warmup replay followed by five timed forward-only replays.
+A device-group reduction after every replay stays outside the timing events.
+All target, inner, draft and profiling graph capture finishes before this
+measurement phase; timed samples never interleave with graph capture or Python
+model forwards. It discards the
 minimum and maximum, and averages the remaining three. The raw curve is not
 made monotonic: candidates use the next captured size's original cost, even
 when a larger graph measured faster. Runtime residuals use this same raw
@@ -130,8 +135,8 @@ costs.
 Forward corrections use at most 5,000 completed samples. Each physical-token-size
 bucket needs ten samples before its median per-token residual contributes to the
 median slope; the correction is zero before any bucket is ready and is clamped to be
-non-negative. The forward medians are maintained incrementally with logarithmic
-updates, without a new package dependency. A cold sampler bucket can therefore
+non-negative. Exact forward medians are maintained incrementally over the bounded
+window, without a new package dependency. A cold sampler bucket can therefore
 use the global estimate while its forward correction is still zero.
 
 Tensor parallelism is supported: TP rank 0 collects runtime samples, maintains
@@ -145,7 +150,7 @@ Dense data-parallel replicas learn independently within their own TP groups.
 For example, `--tensor-parallel-size 2 --data-parallel-size 4` uses eight GPUs
 with four independent cost models.
 
-MoE data parallelism and expert parallelism use one cost model for the TP×DP
+MoE data parallelism uses one cost model for the TP×DP
 expert execution group. Each DP replica contributes its expected accepted tokens;
 the group chooses the complete vector of replica budgets against their
 common physical graph size, including padding imposed by idle replicas. Its
@@ -155,12 +160,55 @@ the agreed batch count used by vLLM's cooperating MTP decode. Local request coun
 remain in observation metadata; they are not summed into a global sampler.
 Only the group driver records runtime observations. Startup forward curves use
 the group mean of rank-local trimmed measurements, with valid dummy tokens and
-randomized token inputs routed through the normal MoE router.
+deterministic physical expert selections following the GPU random-routing
+protocol in DeepInfer's pinned DeepGEMM
+[`store_random_topk_token`](https://github.com/deepseek-ai/DeepGEMM/blob/1fc9c66975ee322d628b3288534ca0e9ce12a64d/deep_gemm/include/deep_gemm/epilogue/sm100_mega_gate.cuh#L219).
+Philox4x32-10 uses the rank as seed and `token * 32 + lane` as subsequence;
+the first two words supply a positive uniform weight and a draw without
+replacement. Weights are not normalized. These tables include redundant physical
+experts and bypass trained score biases, hash choices and logical-to-physical
+EPLB remapping. Local EP streams use their EP rank; gathered tensor-parallel
+streams use a common seed so all shards execute the same physical selections.
+The native shared-expert slot IDs, gate logits and gate weights are retained.
 
-All ranks, including idle ranks, participate in one metadata/price reduction per
-decision. The driver alone learns runtime costs. Every rank derives identical
+Tables are materialized on the host before capture and copied to the device;
+there is no RNG kernel or RNG-state advancement in the measured replay. Startup
+uses startup FULL graphs in a separate shared pool. Profiling routing is removed
+before each serving graph is captured; capture and measurement preserve the
+serving RNG state. No random-routing operations are added to serving graphs.
+Startup graph owners are retained as serving-capture dependencies: native backend
+caches may borrow resources recorded during startup. They are not replayed while
+serving, and are released together with the serving graphs. Their retained memory
+is included in actual capture memory usage; the preliminary graph-memory estimate
+can be lower than this measured usage.
+The selected expert backend and its settings remain unchanged. Kernels without
+a native precomputed physical-routing entry (including monolithic logits-only
+kernels and virtual zero-expert routers) reject this profiling protocol explicitly
+instead of substituting a different backend or approximating random routing.
+This preserves the routing-load protocol, rather than reproducing DeepGEMM's
+fused random-generation kernel cost on a different backend.
+
+Native fallback profiling retains its
+configured KV context and routing behavior. Startup measurements do not record
+synthetic expert load into EPLB serving statistics.
+
+With DP size one, including EP configurations, the existing TP driver and TP
+budget/layout consensus are used directly. No DP budget coordinator or per-step
+metadata/price reduction is created for that path.
+The joint coordinator's fixed-proposal and expert-backend restrictions do not
+apply to DP=1. Native backend, graph and parallel lifecycle checks still apply;
+this does not establish support for online elastic reconfiguration.
+For a dynamic proposal with fewer steps than the configured maximum, the entire
+budget decision uses native startup prices. Runtime calibration remains limited
+to full-step proposals, so their sampler estimates cannot price shorter proposals.
+
+For MoE DP size greater than one, all ranks, including idle ranks, participate
+in one metadata/price reduction per decision. The driver alone learns runtime
+costs. Every rank derives identical
 budgets from the same published prices and acceptance data, without an extra
-object broadcast. Collected observations enter the following step's prices.
+object broadcast. Only DP leaders contribute acceptance vectors; TP followers
+contribute metadata votes. Sampler price tables are reused until observations
+change. Collected observations enter the following step's prices.
 Decisions and observations carry a step, cost version, profiler epoch, replica
 request counts and physical shapes. If any rank is profiling or a replica has
 prefill, the entire group falls back to startup costs. The driver does not learn
@@ -169,11 +217,11 @@ draft batch; this remains a driver estimate, not an all-rank latency average.
 Worker `get_online_cost_feedback_stats` collective RPC returns bounded observation
 and admitted-budget diagnostics for verification and performance analysis.
 
-MoE EP feedback currently requires static groups and the
-`allgather_reducescatter` backend. Context parallelism, elastic EP, other expert
-communication backends and dual-batch overlap remain unsupported by online feedback.
-Batch-size-dependent draft-step schedules are also unsupported for MoE feedback;
-the proposal step count must stay fixed across cooperating replicas.
+For MoE DP size greater than one, online feedback requires static groups and,
+when EP is enabled, the `allgather_reducescatter` backend. Batch-size-dependent
+draft-step schedules remain unsupported for this joint coordinator: the proposal
+step count must stay fixed across cooperating replicas. Context parallelism and
+dual-batch overlap remain unsupported by online feedback at every DP size.
 It learns only from real pure-decode steps using FULL CUDA graphs; prefill,
 dummy steps and unsupported execution shapes retain startup costs. Existing
 adaptive-verification restrictions on attention backends, LoRA and pipeline

@@ -178,6 +178,9 @@ class CudaGraphManager:
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self._capture_dependencies: list[
+            Callable[[BatchExecutionDescriptor, CreateForwardFn], None]
+        ] = []
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
         # The stream of the last capture; graphs replayed inside these ones (in
         # their eager breaks) can capture on it to share the pool's free blocks.
@@ -409,6 +412,7 @@ class CudaGraphManager:
         kept, so `needs_capture()` still reports the work to redo.
         """
         self.graphs.clear()
+        self._capture_dependencies.clear()
         self._graphs_captured = False
         if self.breakable_cg_runner is not None:
             BreakableCUDAGraphWrapper.clear_all_graphs()
@@ -429,6 +433,8 @@ class CudaGraphManager:
         create_forward_fn: CreateForwardFn,
         progress_bar_desc: str = "Capturing CUDA graphs",
         stream: torch.cuda.Stream | None = None,
+        capture_for_profile: Callable[[BatchExecutionDescriptor, CreateForwardFn], None]
+        | None = None,
     ) -> None:
         """Capture CUDA graphs.
 
@@ -440,8 +446,14 @@ class CudaGraphManager:
                 metadata during warmup.
             progress_bar_desc: Description shown on the capture progress bar.
             stream: Capture on this stream instead of a new one.
+            capture_for_profile: Optional profiling-graph capture before each
+                FULL serving graph. Measurements run in a separate phase.
 
         """
+        if capture_for_profile is not None:
+            # Backends may borrow resources recorded by startup capture. Keep
+            # its owner alive until the serving graphs are released together.
+            self._capture_dependencies.append(capture_for_profile)
         with graph_capture(self.device, stream) as context, ExitStack() as stack:
             self.capture_stream = context.stream
             if self.ubatch_runner is not None:
@@ -466,6 +478,8 @@ class CudaGraphManager:
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
+                    if mode == CUDAGraphMode.FULL and capture_for_profile is not None:
+                        capture_for_profile(desc, create_forward_fn)
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
 
@@ -630,6 +644,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_for_profile: Callable[[BatchExecutionDescriptor, CreateForwardFn], None]
+        | None = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -791,7 +807,11 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            progress_bar_desc,
+            capture_for_profile=capture_for_profile,
+        )
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

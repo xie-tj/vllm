@@ -247,6 +247,8 @@ class MoERunner(MoERunnerInterface):
     for different configurations (e.g., with/without shared experts, gates, etc.).
     """
 
+    profile_random_routing: tuple[torch.Tensor, torch.Tensor] | None = None
+
     def __init__(
         self,
         layer_name: str,
@@ -617,7 +619,13 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        profile_routing = getattr(self, "profile_random_routing", None)
         if self.routed_experts.quant_method.is_monolithic:
+            if profile_routing is not None:
+                raise ValueError(
+                    "Exact startup random routing needs a native precomputed-routing "
+                    "entry; this monolithic MoE kernel does not expose one."
+                )
             # Monolithic kernels: pass router_logits to routed_experts
             router_logits = self.router.prepare_monolithic_logits(router_logits)
             fused_out = self.routed_experts.forward_monolithic(
@@ -627,12 +635,34 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if profile_routing is not None:
+                weights, ids = profile_routing
+                num_tokens = hidden_states.shape[0]
+                assert num_tokens <= len(ids)
+                topk_weights, topk_ids = weights[:num_tokens], ids[:num_tokens]
+                if self.routed_experts.expert_map_manager.num_fused_shared_experts:
+                    # Preserve the native shared slot IDs and gate weights. Only
+                    # the routed columns bypass scoring, hash routing and EPLB.
+                    native_weights, native_ids = self.router.select_experts(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                        topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                        input_ids=input_ids,
+                    )
+                    from vllm.model_executor.layers.fused_moe.router.deepinfer_profile import (  # noqa: E501
+                        replace_profile_routed_columns,
+                    )
+
+                    topk_weights, topk_ids = replace_profile_routed_columns(
+                        native_weights, native_ids, topk_weights, topk_ids
+                    )
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,

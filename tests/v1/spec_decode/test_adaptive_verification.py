@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 import os
+import weakref
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import timedelta
@@ -18,11 +20,12 @@ import torch.multiprocessing as mp
 from tests.utils import multi_gpu_test
 from vllm.config import (
     ParallelConfig,
+    SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
     set_current_vllm_config,
 )
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
     get_tp_group,
@@ -37,6 +40,7 @@ from vllm.v1.worker.gpu.async_utils import (
     RuntimeTimingSample,
     StepTimingSample,
 )
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -46,6 +50,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.cost_profile import DecodeCostProfiler
 from vllm.v1.worker.gpu.spec_decode.parallel_cost import (
     BudgetProposal,
     select_parallel_budgets,
@@ -282,7 +287,7 @@ def test_online_profile_uses_trimmed_raw_forward_costs_without_changing_fallback
         ]
         for value in values
     ]
-    manager.set_initial_cost_curves(samples)
+    manager.set_initial_cost_curves(samples, online_samples=samples)
     assert manager.cost_tables is not None
     np.testing.assert_array_equal(manager.cost_tables[1][[4, 8, 16]], [3, 3, 9])
     model = manager.online_cost_model
@@ -560,12 +565,19 @@ def _reference_online_costs(history, num_reqs, candidates):
     return np.array(expected)
 
 
-def test_incremental_cost_medians_match_recomputation_across_evictions():
+@pytest.mark.parametrize("unique_residuals", [False, True])
+def test_incremental_cost_medians_match_recomputation_across_evictions(
+    unique_residuals,
+):
     model = _online_cost_model()
     observations = []
     for index in range(5040):
         size = [4, 8, 16][(index // 7) % 3]
-        residual = [-0.5, 0.0, 0.5, 1.0, 1.0][index % 5]
+        residual = (
+            index / 8192 - 0.5
+            if unique_residuals
+            else [-0.5, 0.0, 0.5, 1.0, 1.0][index % 5]
+        )
         observations.append(
             RuntimeTimingSample(
                 size * (1 + residual),
@@ -699,7 +711,8 @@ def test_online_prices_exclude_piecewise_only_profile_shapes(dist_init):
             StepTimingSample(4.0, 1.0, 4, 1, True),
         ]
         * 5
-        + [StepTimingSample(8.0, 1.0, 8, 2, False)] * 5
+        + [StepTimingSample(8.0, 1.0, 8, 2, False)] * 5,
+        online_samples=[StepTimingSample(4.0, 0.0, 4, 1, True)] * 5,
     )
     assert manager.online_cost_model is not None
     assert manager.online_cost_model.graph_sizes.tolist() == [4]
@@ -720,20 +733,323 @@ def test_online_baseline_does_not_replace_native_profile_prices(dist_init, monke
     batches = list(manager.batches_to_profile([4, 8]))
     samples = [
         StepTimingSample(
-            1.0 if b["context_len"] == 0 else 9.0,
-            99.0 if b["context_len"] == 0 else 1.0,
+            9.0,
+            1.0,
             b["num_tokens"],
             1 if b["num_tokens"] == 4 else 2,
             b["num_tokens"] <= 8,
         )
         for b in batches
     ]
-    manager.set_initial_cost_curves(samples)
+    manager.set_initial_cost_curves(
+        samples,
+        online_samples=[
+            StepTimingSample(1.0, 99.0, size, reqs, True)
+            for size, reqs in [(8, 2), (4, 1)]
+            for _ in range(5)
+        ],
+    )
     assert manager.cost_tables is not None
     assert manager.cost_tables[0][1] == 1.0
     assert manager.cost_tables[1][4] == 9.0
     assert manager.online_cost_model is not None
     assert manager.online_cost_model.get_costs(1, np.array([4])).tolist() == [1.0]
+
+
+def test_online_moe_without_dp_uses_tp_driver(dist_init):
+    """One logical batch needs TP consensus, even when experts cooperate."""
+    device = torch.device("cuda")
+    states = RequestState(2, 32, 16, 3, 32, device)
+    buffers = InputBuffers(2, 16, device)
+    manager = AdaptiveVerificationManager(
+        states,
+        buffers.query_start_loc,
+        1,
+        32,
+        enable_online_cost_feedback=True,
+        coordinate_moe_costs=True,
+    )
+    assert manager.parallel_costs is None
+    list(manager.batches_to_profile([4, 8]))
+    manager.set_cost_curves([(1, 1.0), (2, 1.0)], [(4, 4.0), (8, 8.0)])
+    assert manager.online_cost_model is not None
+    manager.online_cost_model.update([RuntimeTimingSample(8.0, 2.0, 4, 1)] * 10)
+    assert manager.online_cost_model.get_costs(1, np.array([4])).tolist() == [10.0]
+
+
+def _small_moe_model_config(tmp_path, max_model_len=16):
+    from transformers import Qwen3MoeConfig
+
+    from vllm.config import ModelConfig
+
+    Qwen3MoeConfig(
+        architectures=["Qwen3MoeForCausalLM"],
+        hidden_size=128,
+        intermediate_size=256,
+        moe_intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        num_experts=8,
+        num_experts_per_tok=2,
+        vocab_size=64,
+        max_position_embeddings=16,
+    ).save_pretrained(tmp_path)
+    return ModelConfig(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=max_model_len,
+    )
+
+
+@pytest.mark.parametrize(
+    "dp_size,backend,dynamic,error",
+    [
+        (1, "deepep_high_throughput", False, None),
+        (1, "allgather_reducescatter", True, None),
+        (2, "deepep_high_throughput", False, "requires static groups"),
+        (2, "allgather_reducescatter", True, None),
+    ],
+)
+def test_online_moe_factory_limits_joint_coordination_to_dp(
+    dist_init, tmp_path, dp_size, backend, dynamic, error
+):
+    """DP=1 keeps the native schedule/backend while DP>1 guards joint budgets."""
+    model_config = _small_moe_model_config(tmp_path)
+    schedule = [(1, 2, 1), (3, 4, 3)] if dynamic else None
+    config = VllmConfig(
+        model_config=model_config,
+        parallel_config=ParallelConfig(
+            data_parallel_size=dp_size,
+            enable_expert_parallel=True,
+            all2all_backend=backend,
+            distributed_executor_backend="mp",
+        ),
+        speculative_config=SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=3,
+            enable_adaptive_verification=True,
+            enable_online_cost_feedback=True,
+            num_speculative_tokens_per_batch_size=schedule,
+        ),
+        scheduler_config=SchedulerConfig(
+            is_encoder_decoder=False,
+            max_num_seqs=2,
+            max_num_batched_tokens=16,
+            max_model_len=16,
+        ),
+    )
+    assert config.speculative_config is not None
+    if dp_size > 1 and dynamic:
+        # Native config resolves this before the AV factory: retain that
+        # fallback instead of restoring an unsupported dynamic schedule.
+        assert config.speculative_config.num_speculative_tokens_per_batch_size is None
+        assert config.speculative_config.num_speculative_tokens == 3
+        assert not config.speculative_config.uses_dynamic_speculative_decoding()
+        return
+    device = torch.device("cuda")
+    states = RequestState(2, 16, 16, 3, 64, device)
+    buffers = InputBuffers(2, 16, device)
+    kwargs = dict(
+        enable_adaptive_verification=True,
+        attn_groups=[],
+        req_states=states,
+        query_start_loc=buffers.query_start_loc,
+        num_bonus_tokens=1,
+        max_total_logits=16,
+        vllm_config=config,
+    )
+    if error:
+        with pytest.raises(ValueError, match=error):
+            maybe_create_adaptive_verification_manager(**kwargs)
+        return
+
+    manager = maybe_create_adaptive_verification_manager(**kwargs)
+    assert manager is not None and manager.parallel_costs is None
+    assert config.parallel_config.all2all_backend == backend
+    assert config.speculative_config.num_speculative_tokens_per_batch_size == schedule
+    list(manager.batches_to_profile([4, 8]))
+    manager.set_cost_curves([(1, 1.0), (2, 1.0)], [(4, 4.0), (8, 8.0)])
+    assert manager.online_cost_model is not None
+    manager.online_cost_model.update([RuntimeTimingSample(8.0, 2.0, 4, 1)] * 10)
+    assert manager.online_cost_model.get_costs(1, np.array([4])).tolist() == [10.0]
+    # Removing coordination-only guards must not bypass native graph capability.
+    with pytest.raises(ValueError, match="NativeBackend allows none"):
+        maybe_create_adaptive_verification_manager(
+            **kwargs,
+            additional_attn_cg_support=(
+                AttentionCGSupport.UNIFORM_BATCH,
+                "NativeBackend",
+            ),
+        )
+
+
+def test_sampler_prices_refresh_after_new_observations():
+    """Published sampler prices must track both bucket and fallback updates."""
+    model = OnlineCostModel(np.zeros(4), np.ones(9), [4])
+    assert model.get_sampler_costs() == [0.0] * 4
+    model.update([RuntimeTimingSample(4.0, 7.0, 4, 2)] * 5)
+    assert model.get_sampler_costs() == [0.0, 7.0, 7.0, 7.0]
+    model.update([RuntimeTimingSample(4.0, 1.0, 4, 1)] * 5)
+    assert model.get_sampler_costs() == [0.0, 1.0, 7.0, 1.0]
+
+
+def test_shorter_proposal_uses_native_prices_without_changing_schedule(dist_init):
+    """Full-step sampler observations cannot price a shorter current proposal."""
+    device = torch.device("cuda")
+    states = RequestState(1, 16, 8, 3, 64, device)
+    states.add_request("req", 1, [0], 1, 15)
+    states.apply_staged_writes()
+    buffers = InputBuffers(1, 8, device)
+    manager = AdaptiveVerificationManager(
+        states, buffers.query_start_loc, 1, 8, enable_online_cost_feedback=True
+    )
+    manager.add_request(states.req_id_to_index["req"])
+    list(manager.batches_to_profile([1, 2, 3]))
+    manager.set_cost_curves([(1, 1.0)], [(1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0)])
+    batch = InputBatch.make_dummy(1, 2, buffers)
+    for _ in range(3):
+        manager.record_confidences(torch.full((1, 3), 0.1, device=device), batch)
+    assert manager.online_cost_model is not None
+    manager.online_cost_model.update([RuntimeTimingSample(31.0, 1.0, 3, 1)] * 10)
+    scheduled, drafts = {"req": 2}, {"req": [1]}
+    assert manager.get_num_tokens(scheduled, drafts, num_proposal_steps=3) == 1
+    assert manager.get_num_tokens(scheduled, drafts, num_proposal_steps=1) == 2
+    assert scheduled == {"req": 2} and drafts == {"req": [1]}
+    assert manager.online_cost_model.num_samples == 10
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("routing", ["plain", "bias", "hash"])
+def test_startup_random_routing_preserves_serving_graphs_and_rng(
+    dist_init, routing, tmp_path
+):
+    """Only temporary graphs may route away from a deliberately biased gate."""
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    device = torch.device("cuda")
+    config = VllmConfig(
+        model_config=_small_moe_model_config(tmp_path, max_model_len=8),
+        scheduler_config=SchedulerConfig(
+            is_encoder_decoder=False,
+            max_num_seqs=8,
+            max_num_batched_tokens=8,
+            max_model_len=8,
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            cudagraph_capture_sizes=[4, 8],
+            max_cudagraph_capture_size=8,
+        ),
+    )
+    config.kernel_config.moe_backend = "triton"
+    with set_current_vllm_config(config), torch.device(device):
+        init_workspace_manager(torch.accelerator.current_device_index())
+        model = FusedMoEFactory(
+            num_experts=8,
+            top_k=1,
+            hidden_size=128,
+            intermediate_size=128,
+            params_dtype=torch.bfloat16,
+            renormalize=True,
+            scoring_func="sqrtsoftplus" if routing == "hash" else "softmax",
+            e_score_correction_bias=(
+                torch.nn.Parameter(torch.tensor([1000.0] + [0.0] * 7, device=device))
+                if routing in ("bias", "hash")
+                else None
+            ),
+            hash_indices_table=(
+                torch.zeros(16, 1, dtype=torch.int64, device=device)
+                if routing == "hash"
+                else None
+            ),
+            prefix="startup_random_routing",
+        )
+        model.routed_experts.w13_weight.normal_(0, 0.01)
+        model.routed_experts.w2_weight.normal_(0, 0.01)
+        model._quant_method.process_weights_after_loading(model.routed_experts)
+        buffers = InputBuffers(8, 8, device)
+        inputs = torch.ones(8, 128, dtype=torch.bfloat16, device=device)
+        logits = torch.full((8, 8), -20.0, device=device)
+        logits[:, 0] = 20.0
+        output = torch.empty_like(inputs)
+        graphs = CudaGraphManager(config, device, CUDAGraphMode.FULL_DECODE_ONLY, 1)
+        profiler = DecodeCostProfiler(model, buffers, config, moe=True)
+        measuring = False
+
+        def create_forward(desc, warmup):
+            buffers.is_padding.fill_(True)
+            buffers.input_ids.zero_()
+
+            def forward(mode):
+                assert not measuring, "Measurement must not call the Python model"
+                with set_forward_context(
+                    None,
+                    config,
+                    num_tokens=desc.num_tokens,
+                    is_padding=buffers.is_padding[: desc.num_tokens],
+                ):
+                    output[: desc.num_tokens].copy_(
+                        model(
+                            inputs[: desc.num_tokens],
+                            logits[: desc.num_tokens],
+                            input_ids=buffers.input_ids[: desc.num_tokens],
+                        )
+                    )
+
+            return forward
+
+        before = torch.cuda.get_rng_state(device)
+        graphs.capture(create_forward, capture_for_profile=profiler.capture)
+        assert profiler.samples == []
+        assert model.profile_random_routing is None
+        measuring = True
+        profiler.measure()
+        measuring = False
+        assert [s.num_target_tokens for s in profiler.samples] == [8] * 5 + [4] * 5
+        assert all(s.forward_ms > 0 and s.drafter_ms == 0 for s in profiler.samples)
+        weights, ids = profiler.routes[model]
+        assert torch.unique(ids[:8]).numel() > 1
+        # Compare the measured graph's output with the native expert entry fed
+        # explicit physical selections, independently of the bias/hash router.
+        measured_output = output[:4].clone()
+        expected_weights, expected_ids = weights[:4], ids[:4]
+        with set_forward_context(None, config, num_tokens=4):
+            reference = model.routed_experts.forward_modular(
+                inputs[:4], expected_weights, expected_ids, None, None
+            )
+        torch.testing.assert_close(measured_output, reference, rtol=0, atol=0)
+        assert model.profile_random_routing is None
+        assert torch.equal(torch.cuda.get_rng_state(device), before)
+
+        desc = graphs.dispatch(8, 8, 1, 0)
+        forward = create_forward(desc, warmup=False)
+        buffers.is_padding.fill_(False)
+        forward(CUDAGraphMode.NONE)
+        expected = output.clone()
+        graphs.run_fullgraph(desc)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+        def failing_forward(desc, warmup):
+            raise RuntimeError("profiling preparation failed")
+
+        with pytest.raises(RuntimeError, match="profiling preparation failed"):
+            profiler.capture(desc, failing_forward)
+        assert model.profile_random_routing is None
+        assert torch.equal(torch.cuda.get_rng_state(device), before)
+
+        owner = weakref.ref(profiler)
+        del profiler
+        gc.collect()
+        assert owner() is not None, "Serving graphs must retain startup capture owners"
+        graphs.run_fullgraph(desc)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        graphs.release_graphs()
+        gc.collect()
+        assert owner() is None
 
 
 def _check_online_moe_group(manager, rank, dp_rank, device):

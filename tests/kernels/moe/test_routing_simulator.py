@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import
     RoutingSimulator,
     RoutingSimulatorRouter,
 )
+from vllm.platforms import current_platform
 
 
 @pytest.fixture
@@ -319,3 +320,183 @@ def test_runner_prepares_monolithic_logits(monkeypatch, device):
     assert passed.device == logits.device
     assert torch.all((passed >= -1) & (passed <= 0))
     assert torch.all(logits == 7)
+
+
+def _deepinfer_routing_reference(num_tokens, num_experts, top_k, rank):
+    """Use the independent Torch Philox implementation and sequential unranking."""
+    from vllm.v1.watermarking.prfs.philox import _philox4x32_10
+
+    lanes = torch.arange(top_k, dtype=torch.int64).unsqueeze(0)
+    subsequences = torch.arange(num_tokens, dtype=torch.int64).unsqueeze(1) * 32 + lanes
+    zeros = torch.zeros_like(subsequences)
+    words = _philox4x32_10(
+        (zeros, zeros, subsequences & 0xFFFFFFFF, subsequences >> 32),
+        (
+            torch.full_like(subsequences, rank & 0xFFFFFFFF),
+            torch.full_like(subsequences, rank >> 32),
+        ),
+    )
+    weights = words[0].to(torch.float32) * 2**-32 + 2**-33
+    ids = []
+    for token in range(num_tokens):
+        selected: list[int] = []
+        for lane in range(top_k):
+            candidate = int(words[1][token, lane]) % (num_experts - lane)
+            # Draw an index in the remaining sorted population. This avoids
+            # copying the production implementation's parallel minimum loop.
+            for previous in sorted(selected):
+                if candidate >= previous:
+                    candidate += 1
+            selected.append(candidate)
+        ids.append(selected)
+    return weights, torch.tensor(ids, dtype=torch.int64).reshape(num_tokens, top_k)
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+@pytest.mark.parametrize("top_k", [1, 8, 10])
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+def test_deepinfer_profile_routing_matches_curand_protocol(rank, top_k, indices_dtype):
+    """Physical experts, rank seeds and first two Philox words define routing."""
+    from vllm.model_executor.layers.fused_moe.router.deepinfer_profile import (
+        make_deepinfer_profile_routing,
+    )
+
+    # Ten physical experts can include replicas beyond eight logical experts.
+    num_tokens, num_experts = 17, 10
+    before = torch.get_rng_state()
+    weights, ids = make_deepinfer_profile_routing(
+        num_tokens, num_experts, top_k, rank, torch.device("cpu"), indices_dtype
+    )
+    expected_weights, expected_ids = _deepinfer_routing_reference(
+        num_tokens, num_experts, top_k, rank
+    )
+    assert weights.dtype == torch.float32
+    assert ids.dtype == indices_dtype
+    assert torch.equal(weights, expected_weights)
+    assert torch.equal(ids.to(torch.int64), expected_ids)
+    assert torch.all((weights > 0) & (weights <= 1))
+    assert torch.all((ids >= 0) & (ids < num_experts))
+    sorted_ids = ids.sort(dim=-1).values
+    assert torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1])
+    if top_k == num_experts:
+        assert torch.equal(
+            sorted_ids.to(torch.int64), torch.arange(num_experts).expand(num_tokens, -1)
+        )
+    repeated = make_deepinfer_profile_routing(
+        num_tokens, num_experts, top_k, rank, torch.device("cpu"), indices_dtype
+    )
+    prefix = make_deepinfer_profile_routing(
+        5, num_experts, top_k, rank, torch.device("cpu"), indices_dtype
+    )
+    assert torch.equal(weights, repeated[0]) and torch.equal(ids, repeated[1])
+    assert torch.equal(weights[:5], prefix[0]) and torch.equal(ids[:5], prefix[1])
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_deepinfer_profile_routing_first_philox_vector():
+    """Lock seed/subsequence/word ordering to the published zero-counter vector."""
+    from vllm.model_executor.layers.fused_moe.router.deepinfer_profile import (
+        make_deepinfer_profile_routing,
+    )
+    from vllm.v1.watermarking.prfs.philox import _philox4x32_10
+
+    zero = torch.tensor(0, dtype=torch.int64)
+    words = _philox4x32_10((zero, zero, zero, zero), (zero, zero))
+    assert tuple(int(word) for word in words) == (
+        0x6627E8D5,
+        0xE169C58D,
+        0xBC57AC4C,
+        0x9B00DBD8,
+    )
+    weights, ids = make_deepinfer_profile_routing(1, 10, 1, 0, torch.device("cpu"))
+    expected_weight = torch.tensor(0x6627E8D5, dtype=torch.float32) * 2**-32 + 2**-33
+    assert weights[0, 0] == expected_weight
+    assert ids.tolist() == [[0xE169C58D % 10]]
+
+
+def test_deepinfer_profile_preserves_shared_gate_weights_and_ids():
+    """Random routed slots must not overwrite native sigmoid shared gates."""
+    from vllm.model_executor.layers.fused_moe.router.deepinfer_profile import (
+        make_deepinfer_profile_routing,
+        replace_profile_routed_columns,
+    )
+
+    shared_logits = torch.tensor([[-3.0, 2.0], [0.0, 5.0]])
+    shared_weights = shared_logits.sigmoid()
+    shared_ids = torch.tensor([[10, 11], [10, 11]], dtype=torch.int32)
+    native_weights = torch.cat((torch.ones(2, 2), shared_weights), dim=1)
+    native_ids = torch.cat((torch.zeros(2, 2, dtype=torch.int32), shared_ids), dim=1)
+    weights, ids = make_deepinfer_profile_routing(2, 10, 2, 0, torch.device("cpu"))
+    actual_weights, actual_ids = replace_profile_routed_columns(
+        native_weights, native_ids, weights, ids
+    )
+    assert torch.equal(actual_weights[:, :2], weights)
+    assert torch.equal(actual_ids[:, :2], ids)
+    assert torch.equal(actual_weights[:, 2:], shared_weights)
+    assert torch.equal(actual_ids[:, 2:], shared_ids)
+    assert torch.equal(shared_logits, torch.tensor([[-3.0, 2.0], [0.0, 5.0]]))
+
+
+@pytest.fixture(scope="module")
+def curand_profile_reference():
+    from torch.utils.cpp_extension import load_inline
+
+    return load_inline(
+        name="deepinfer_profile_curand_reference",
+        cpp_sources="""
+        std::vector<torch::Tensor> profile_words(
+            int64_t tokens, int64_t experts, int64_t k, int64_t rank);
+        """,
+        cuda_sources="""
+        #include <torch/extension.h>
+        #include <curand_kernel.h>
+        #include <c10/cuda/CUDAStream.h>
+        #include <c10/cuda/CUDAException.h>
+        __global__ void generate(float* weights, int64_t* draws, int tokens,
+                                 int experts, int k, uint64_t rank) {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i >= tokens * k) return;
+            int token = i / k, lane = i % k;
+            curandStatePhilox4_32_10_t state;
+            curand_init(rank, uint64_t(token) * 32 + lane, 0, &state);
+            weights[i] = curand_uniform(&state);
+            draws[i] = curand(&state) % (experts - lane);
+        }
+        std::vector<torch::Tensor> profile_words(
+            int64_t tokens, int64_t experts, int64_t k, int64_t rank) {
+            auto options = torch::TensorOptions().device(torch::kCUDA);
+            auto weights = torch::empty({tokens, k}, options.dtype(torch::kFloat32));
+            auto draws = torch::empty({tokens, k}, options.dtype(torch::kInt64));
+            generate<<<(tokens * k + 127) / 128, 128, 0,
+                       c10::cuda::getCurrentCUDAStream()>>>(
+                weights.data_ptr<float>(), draws.data_ptr<int64_t>(),
+                tokens, experts, k, rank);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return {weights, draws};
+        }
+        """,
+        functions=["profile_words"],
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="NVIDIA cuRAND reference requires CUDA"
+)
+@pytest.mark.parametrize("rank", [0, 3])
+@pytest.mark.parametrize("top_k", [1, 8, 32])
+def test_deepinfer_profile_matches_cuda_curand(curand_profile_reference, rank, top_k):
+    """Check actual cuRAND seed/subsequence/word order, not just CPU Philox math."""
+    from vllm.model_executor.layers.fused_moe.router.deepinfer_profile import (
+        make_deepinfer_profile_routing,
+    )
+
+    weights, draws = curand_profile_reference.profile_words(17, 64, top_k, rank)
+    expected_ids = []
+    for row in draws.cpu().tolist():
+        population = list(range(64))
+        expected_ids.append([population.pop(draw) for draw in row])
+    actual_weights, actual_ids = make_deepinfer_profile_routing(
+        17, 64, top_k, rank, torch.device("cpu")
+    )
+    assert torch.equal(actual_weights, weights.cpu())
+    assert actual_ids.tolist() == expected_ids

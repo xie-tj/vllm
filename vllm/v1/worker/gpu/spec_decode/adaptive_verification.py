@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
+from bisect import bisect_left, insort
 from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
 from statistics import median
 from typing import TYPE_CHECKING
 
@@ -235,132 +235,30 @@ class AdmittedDraftCounts:
         return self._cpu.numpy()
 
 
-@dataclass
-class _MedianNode:
-    value: float
-    count: int = 1
-    size: int = 1
-    height: int = 1
-    left: "_MedianNode | None" = None
-    right: "_MedianNode | None" = None
-
-
 class _MedianTracker:
-    """An AVL multiset with logarithmic insert, removal and median lookup."""
+    """Exact medians for the cost model's bounded observation window."""
 
     def __init__(self) -> None:
-        self._root: _MedianNode | None = None
+        self._values: list[float] = []
 
     def __len__(self) -> int:
-        return self._size(self._root)
-
-    @staticmethod
-    def _size(node: _MedianNode | None) -> int:
-        return node.size if node is not None else 0
-
-    @staticmethod
-    def _height(node: _MedianNode | None) -> int:
-        return node.height if node is not None else 0
-
-    @classmethod
-    def _refresh(cls, node: _MedianNode) -> None:
-        node.size = node.count + cls._size(node.left) + cls._size(node.right)
-        node.height = 1 + max(cls._height(node.left), cls._height(node.right))
-
-    @classmethod
-    def _rotate_left(cls, node: _MedianNode) -> _MedianNode:
-        pivot = node.right
-        assert pivot is not None
-        node.right, pivot.left = pivot.left, node
-        cls._refresh(node)
-        cls._refresh(pivot)
-        return pivot
-
-    @classmethod
-    def _rotate_right(cls, node: _MedianNode) -> _MedianNode:
-        pivot = node.left
-        assert pivot is not None
-        node.left, pivot.right = pivot.right, node
-        cls._refresh(node)
-        cls._refresh(pivot)
-        return pivot
-
-    @classmethod
-    def _balance(cls, node: _MedianNode) -> _MedianNode:
-        cls._refresh(node)
-        if cls._height(node.left) > cls._height(node.right) + 1:
-            assert node.left is not None
-            if cls._height(node.left.left) < cls._height(node.left.right):
-                node.left = cls._rotate_left(node.left)
-            return cls._rotate_right(node)
-        if cls._height(node.right) > cls._height(node.left) + 1:
-            assert node.right is not None
-            if cls._height(node.right.right) < cls._height(node.right.left):
-                node.right = cls._rotate_right(node.right)
-            return cls._rotate_left(node)
-        return node
-
-    @classmethod
-    def _insert(cls, node: _MedianNode | None, value: float) -> _MedianNode:
-        if node is None:
-            return _MedianNode(value)
-        if value < node.value:
-            node.left = cls._insert(node.left, value)
-        elif value > node.value:
-            node.right = cls._insert(node.right, value)
-        else:
-            node.count += 1
-        return cls._balance(node)
-
-    @classmethod
-    def _erase(
-        cls, node: _MedianNode | None, value: float, count: int = 1
-    ) -> _MedianNode | None:
-        assert node is not None
-        if value < node.value:
-            node.left = cls._erase(node.left, value, count)
-        elif value > node.value:
-            node.right = cls._erase(node.right, value, count)
-        elif node.count > count:
-            node.count -= count
-        elif node.left is None:
-            return node.right
-        elif node.right is None:
-            return node.left
-        else:
-            successor = node.right
-            while successor.left is not None:
-                successor = successor.left
-            node.value, node.count = successor.value, successor.count
-            node.right = cls._erase(node.right, successor.value, successor.count)
-        return cls._balance(node)
+        return len(self._values)
 
     def add(self, value: float) -> None:
-        self._root = self._insert(self._root, value)
+        insort(self._values, value)
 
     def remove(self, value: float) -> None:
-        self._root = self._erase(self._root, value)
-
-    def _select(self, index: int) -> float:
-        node = self._root
-        while node is not None:
-            left_size = self._size(node.left)
-            if index < left_size:
-                node = node.left
-            elif index < left_size + node.count:
-                return node.value
-            else:
-                index -= left_size + node.count
-                node = node.right
-        raise IndexError(index)
+        index = bisect_left(self._values, value)
+        assert index < len(self._values) and self._values[index] == value
+        self._values.pop(index)
 
     def median(self) -> float:
         size = len(self)
         assert size > 0
         middle = size // 2
         if size % 2:
-            return self._select(middle)
-        return self._select(middle - 1) * 0.5 + self._select(middle) * 0.5
+            return self._values[middle]
+        return self._values[middle - 1] * 0.5 + self._values[middle] * 0.5
 
 
 class OnlineCostModel:
@@ -391,6 +289,7 @@ class OnlineCostModel:
         )
         self._sampler_fallback: deque[float] = deque(maxlen=9)
         self._slope = 0.0
+        self._sampler_costs: list[float] | None = None
 
     @property
     def num_samples(self) -> int:
@@ -434,6 +333,7 @@ class OnlineCostModel:
             self._update_forward(size, residual, insert=True)
             self._sampler_samples[reqs].append(sample.sampler_ms)
             self._sampler_fallback.append(sample.sampler_ms)
+            self._sampler_costs = None
             accepted.append(sample)
 
         self._slope = (
@@ -458,7 +358,11 @@ class OnlineCostModel:
         return self._forward_cost + self._slope * self.graph_sizes
 
     def get_sampler_costs(self) -> list[float]:
-        return [0.0] + [self._sampler_ms(n) for n in range(1, len(self.draft_cost))]
+        if self._sampler_costs is None:
+            self._sampler_costs = [0.0] + [
+                self._sampler_ms(n) for n in range(1, len(self.draft_cost))
+            ]
+        return self._sampler_costs
 
     def get_costs(self, num_reqs: int, num_tokens: np.ndarray) -> np.ndarray:
         costs = self.draft_cost[num_reqs] + self.verify_cost[num_tokens]
@@ -476,7 +380,6 @@ class OnlineCostModel:
 class AdaptiveVerificationManager:
     parallel_costs: ParallelCostCoordinator | None = None
     enable_online_cost_feedback = False
-    _native_profile_count = 0
 
     def __init__(
         self,
@@ -505,7 +408,7 @@ class AdaptiveVerificationManager:
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
         self.parallel_costs = (
             ParallelCostCoordinator(req_states.max_num_batched_tokens)
-            if coordinate_moe_costs
+            if coordinate_moe_costs and get_dp_group().world_size > 1
             else None
         )
         self.synchronize_tp_decisions = get_tp_group().world_size > 1
@@ -595,34 +498,19 @@ class AdaptiveVerificationManager:
                 tail_sizes.add(size)
             tail_sizes -= set(capture_sizes)
         native_sizes = capture_sizes + sorted(tail_sizes)
-        self._native_profile_count = len(native_sizes) * _PROFILE_REPLAYS
         for num_tokens in native_sizes:
             for _ in range(_PROFILE_REPLAYS):
                 yield {
                     "num_tokens": num_tokens,
                     "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
                 }
-        if not self.enable_online_cost_feedback:
-            return
-        # Keep native fallback profiling intact; the online baseline has no history.
-        group = self.parallel_costs.group if self.parallel_costs else get_tp_group()
-        for num_tokens in capture_sizes:
-            for _ in range(_PROFILE_REPLAYS):
-                with gpu_sync_allowed():
-                    torch.accelerator.synchronize()
-                group.barrier()
-                yield {
-                    "num_tokens": num_tokens,
-                    "context_len": 0,
-                    "randomize_inputs": self.profile_moe,
-                    "route_dummy_tokens": self.profile_moe,
-                }
 
-    def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
-        end = self._native_profile_count or len(samples)
-        native_samples = samples[:end]
-        online_samples = samples[end:] or native_samples
-
+    def set_initial_cost_curves(
+        self,
+        samples: list[StepTimingSample],
+        *,
+        online_samples: Iterable[StepTimingSample] = (),
+    ) -> None:
         def median_curve(
             points: Iterable[tuple[int, float]],
         ) -> list[tuple[int, float]]:
@@ -636,10 +524,10 @@ class AdaptiveVerificationManager:
         # and request counts — unlike token counts — collide across execution
         # modes, so only graph-replay samples may price the draft curve.
         draft_curve = median_curve(
-            (s.num_reqs, s.drafter_ms) for s in native_samples if s.full_cudagraph
+            (s.num_reqs, s.drafter_ms) for s in samples if s.full_cudagraph
         )
         verify_curve = median_curve(
-            (s.num_target_tokens, s.forward_ms) for s in native_samples
+            (s.num_target_tokens, s.forward_ms) for s in samples
         )
         online_forward_curve = None
         if self.enable_online_cost_feedback:
@@ -824,6 +712,7 @@ class AdaptiveVerificationManager:
         draft_tokens: dict[str, list[int]],
         *,
         has_prefill: bool = False,
+        num_proposal_steps: int | None = None,
     ) -> int:
         """Token count once the draft budget is trimmed to fit.
 
@@ -869,6 +758,10 @@ class AdaptiveVerificationManager:
             self.online_cost_model is not None
             and self.parallel_costs is None
             and not has_prefill
+            and (
+                num_proposal_steps is None
+                or num_proposal_steps == self.num_speculative_steps
+            )
             and num_non_draft_tokens_total <= self._cudagraph_limit
         )
         if use_online:
@@ -1076,7 +969,7 @@ def maybe_create_adaptive_verification_manager(
         online
         and vllm_config.model_config is not None
         and vllm_config.model_config.is_moe
-        and (parallel.data_parallel_size > 1 or parallel.enable_expert_parallel)
+        and parallel.data_parallel_size > 1
     )
     if (
         coordinate_moe

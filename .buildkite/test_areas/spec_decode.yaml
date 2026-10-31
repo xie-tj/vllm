@@ -43,6 +43,7 @@ steps:
     - vllm/config/speculative.py
     - vllm/v1/attention/
     - vllm/distributed/
+    - vllm/model_executor/layers/fused_moe/
     - vllm/v1/worker/gpu/
     - vllm/v1/worker/gpu_worker.py
     - tests/v1/spec_decode/test_adaptive_verification.py
@@ -51,6 +52,7 @@ steps:
     - pytest -v -s v1/spec_decode/test_adaptive_verification.py -k online_tp_dp
     - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_online_cost_feedback_tensor_parallel_generation
     - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_online_cost_feedback_native_backend_generation
+    - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_online_cost_feedback_moe_ep_without_dp_uses_tp_driver
     - >-
       pytest -v -s
       v1/worker/test_gpu_input_batch_v2.py

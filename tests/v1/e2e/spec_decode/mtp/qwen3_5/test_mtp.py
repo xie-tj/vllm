@@ -10,7 +10,7 @@ import pytest
 
 from tests.utils import RemoteOpenAIServer, multi_gpu_test, single_gpu_only
 from vllm import SamplingParams
-from vllm.config import CompilationConfig, CUDAGraphMode
+from vllm.config import CompilationConfig, CUDAGraphMode, KernelConfig
 from vllm.platforms import current_platform
 
 from ...utils import (
@@ -78,6 +78,94 @@ def test_online_cost_feedback_native_backend_generation(
 ):
     """The native backend selector finds a compatible variable-query backend."""
     _check_online_mtp_generation(monkeypatch, vllm_runner, True, native_settings=True)
+
+
+@pytest.mark.parametrize("dynamic_steps", [False, True], ids=["fixed", "dynamic"])
+@multi_gpu_test(num_gpus=2)
+def test_online_cost_feedback_moe_ep_without_dp_uses_tp_driver(
+    monkeypatch, vllm_runner, enable_pickle, dynamic_steps
+):
+    """EP with one batch retains native settings and learns only on the TP driver."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model = os.environ.get("VLLM_TEST_MOE_MTP_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
+    with vllm_runner(
+        model,
+        tensor_parallel_size=2,
+        enable_expert_parallel=True,
+        all2all_backend="allgather_reducescatter",
+        max_model_len=512,
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        block_size=None,
+        enable_chunked_prefill=None,
+        compilation_config=CompilationConfig(),
+        kernel_config=KernelConfig(),
+        limit_mm_per_prompt={"image": 0, "video": 0},
+        speculative_config={
+            "method": "mtp",
+            "num_speculative_tokens": 3,
+            "enable_adaptive_verification": True,
+            "enable_online_cost_feedback": True,
+            **(
+                {"num_speculative_tokens_per_batch_size": [(1, 1, 3), (2, 2, 1)]}
+                if dynamic_steps
+                else {}
+            ),
+        },
+    ) as runner:
+        params = SamplingParams(
+            temperature=0,
+            max_tokens=128,
+            ignore_eos=True,
+            allowed_token_ids=[42],
+        )
+        outputs = runner.llm.generate(
+            ["Continue the following: hello"],
+            params,
+        )
+        assert list(outputs[0].outputs[0].token_ids) == [42] * 128
+        if dynamic_steps:
+            outputs = runner.llm.generate(
+                ["Continue the following: first", "Continue the following: second"],
+                params,
+            )
+            assert all(list(o.outputs[0].token_ids) == [42] * 128 for o in outputs)
+
+        def state(worker):
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+            model_runner = worker.model_runner
+            manager = model_runner.adaptive_verification
+            cost_model = manager.online_cost_model
+            config = model_runner.vllm_config
+            return {
+                "coordinator_bypassed": manager.parallel_costs is None,
+                "samples": None if cost_model is None else cost_model.num_samples,
+                "random_routing_active": any(
+                    m.profile_random_routing is not None
+                    for m in model_runner.model.modules()
+                    if isinstance(m, MoERunner)
+                ),
+                "schedule": (
+                    config.speculative_config.num_speculative_tokens_per_batch_size
+                ),
+                "dp_size": config.parallel_config.data_parallel_size,
+                "prefix_caching": config.cache_config.enable_prefix_caching,
+                "chunked_prefill": config.scheduler_config.enable_chunked_prefill,
+                "moe_backend": config.kernel_config.moe_backend,
+                "jit_warmup": config.kernel_config.enable_jit_warmup,
+            }
+
+        states = runner.llm.collective_rpc(state)
+        print("DP1_STATE " + json.dumps(states))
+        assert all(
+            s["coordinator_bypassed"] and not s["random_routing_active"] for s in states
+        )
+        assert all(s["dp_size"] == 1 for s in states)
+        expected_schedule = [(1, 1, 3), (2, 2, 1)] if dynamic_steps else None
+        assert all(s["schedule"] == expected_schedule for s in states)
+        assert states[0]["samples"] >= 10
+        assert states[1]["samples"] is None
 
 
 @pytest.mark.distributed(num_gpus=2)

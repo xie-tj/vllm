@@ -41,7 +41,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -164,6 +164,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.cost_profile import DecodeCostProfiler
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     requires_aux_hidden_states,
     set_eagle3_aux_hidden_state_layers,
@@ -869,7 +870,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
-        route_dummy_tokens: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -949,7 +949,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 randomize_inputs=randomize_inputs,
-                route_dummy_tokens=route_dummy_tokens,
             )
         self.kv_connector.set_disabled(False)
 
@@ -1141,21 +1140,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_buffers = self.input_buffers
                     if self.pcp_manager is not None:
                         input_buffers = self.pcp_manager.input_buffers
-                    self.cudagraph_manager.capture(
-                        self.model,
-                        self.model_state,
-                        input_buffers,
-                        self.intermediate_tensors,
-                        self.block_tables,
-                        self.attn_groups,
-                        self.kv_cache_config,
-                        pcp_manager=self.pcp_manager,
-                        has_lora=self.lora_config is not None,
-                        use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                        lora_capture_hook=create_lora_capture_hook(
-                            self.lora_config, self
-                        ),
+                    cost_profiler = (
+                        DecodeCostProfiler(
+                            self.model,
+                            input_buffers,
+                            self.vllm_config,
+                            moe=self.adaptive_verification.profile_moe,
+                        )
+                        if self.adaptive_verification is not None
+                        and self.adaptive_verification.enable_online_cost_feedback
+                        and not profile_only
+                        else None
                     )
+                    with self.eplb.suppress() if cost_profiler else nullcontext():
+                        self.cudagraph_manager.capture(
+                            self.model,
+                            self.model_state,
+                            input_buffers,
+                            self.intermediate_tensors,
+                            self.block_tables,
+                            self.attn_groups,
+                            self.kv_cache_config,
+                            pcp_manager=self.pcp_manager,
+                            has_lora=self.lora_config is not None,
+                            use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                            lora_capture_hook=create_lora_capture_hook(
+                                self.lora_config, self
+                            ),
+                            capture_for_profile=(
+                                cost_profiler.capture if cost_profiler else None
+                            ),
+                        )
                     self.model_state.capture_inner_cudagraphs(
                         input_buffers,
                         self.block_tables,
@@ -1166,13 +1181,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
+                    if cost_profiler is not None:
+                        with self.eplb.suppress():
+                            cost_profiler.measure()
                     if self.adaptive_verification is not None and not profile_only:
                         with self.step_timing.collect() as timings:
                             for batch in self.adaptive_verification.batches_to_profile(
                                 self.cudagraph_manager.captured_token_counts()
                             ):
                                 self._dummy_run(**batch)
-                        self.adaptive_verification.set_initial_cost_curves(timings)
+                        self.adaptive_verification.set_initial_cost_curves(
+                            timings,
+                            online_samples=(
+                                cost_profiler.samples if cost_profiler else ()
+                            ),
+                        )
                         # Release the profiling runs' activations, or the
                         # allocator cache is counted as graph memory below.
                         torch.accelerator.empty_cache()
@@ -1403,7 +1426,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.adaptive_verification is not None:
                 num_toks = self.adaptive_verification.get_num_tokens(
-                    num_tokens_per_req, draft_tokens, has_prefill=has_prefill
+                    num_tokens_per_req,
+                    draft_tokens,
+                    has_prefill=has_prefill,
+                    num_proposal_steps=scheduler_output.num_spec_tokens_to_schedule,
                 )
 
         prefill_runs_as_decode_np = None
@@ -1819,7 +1845,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
-        route_dummy_tokens: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if (
             self.runtime_timing is not None
@@ -1964,13 +1989,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
                 # Profiling and warmup must route the dummy tokens to experts
                 # so MoE memory is measured and MoE kernels are exercised.
-                is_padding=not (is_profile or route_dummy_tokens),
+                is_padding=not is_profile,
             )
             if randomize_inputs:
                 # All-zero input_ids route every token to the same experts.
                 input_batch.input_ids.random_(0, self.vocab_size)
-                if route_dummy_tokens:
-                    get_tp_group().broadcast(input_batch.input_ids, src=0)
             if self.pcp_manager is not None:
                 input_batch = self.pcp_manager.prepare_inputs_for_capture_or_profile(
                     input_batch

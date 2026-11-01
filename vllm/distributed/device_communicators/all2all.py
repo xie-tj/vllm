@@ -142,7 +142,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
             and dist_group.world_size > 1
             and len(tensors_to_gather) == 4
             and all(t.ndim == 2 for t in tensors_to_gather)
-            and (max(sizes) >= 16 or len(set(sizes)) > 1)
+            and (max(sizes) >= 8 or len(set(sizes)) > 1)
         ):
             from .packed_moe_dispatch import packed_all_gatherv
 

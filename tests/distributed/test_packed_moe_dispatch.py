@@ -53,7 +53,15 @@ def _worker(rank, store):
         try:
             group = get_ep_group()
             assert group.world_size == 8
-            for first, second in ((1, 0), (4, 4), (16, 16), (64, 32), (128, 128)):
+            for first, second in (
+                (1, 0),
+                (4, 4),
+                (8, 8),
+                (12, 12),
+                (16, 16),
+                (64, 32),
+                (128, 128),
+            ):
                 sizes = [first] * 4 + [second] * 4
                 rows = sizes[rank]
                 torch.manual_seed(42 + rank)

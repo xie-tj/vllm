@@ -60,6 +60,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
         self.use_ep = get_current_vllm_config().parallel_config.enable_expert_parallel
+        self.pack_dispatch = (
+            get_current_vllm_config().kernel_config.enable_moe_dispatch_packing
+        )
 
     def _get_comm_group(self, is_sequence_parallel: bool) -> Any:
         if is_sequence_parallel:
@@ -133,11 +136,23 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
-        )
+        if (
+            self.pack_dispatch
+            and hidden_states.is_cuda
+            and dist_group.world_size > 1
+            and len(tensors_to_gather) == 4
+            and all(t.ndim == 2 for t in tensors_to_gather)
+            and (max(sizes) >= 16 or len(set(sizes)) > 1)
+        ):
+            from .packed_moe_dispatch import packed_all_gatherv
+
+            gathered_tensors = packed_all_gatherv(tensors_to_gather, dist_group, sizes)
+        else:
+            gathered_tensors = dist_group.all_gatherv(
+                tensors_to_gather,
+                dim=0,
+                sizes=sizes,
+            )
 
         hidden_states = gathered_tensors[0]
         topk_weights = gathered_tensors[1]

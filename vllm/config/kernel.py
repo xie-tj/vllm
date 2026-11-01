@@ -305,6 +305,12 @@ class KernelConfig:
     in a single launch (DeepSeek-V4.1 on MI355X, DeepSeek-V4-Pro at TP8 on
     MI355X). A deployment that cannot run it is refused at startup."""
 
+    enable_moe_dispatch_packing: bool = False
+    """Pack four modular MoE tensors into one byte payload for CUDA
+    allgather_reducescatter dispatch. Preserves dtypes, routes and scales.
+    Small balanced payloads and other formats retain native dispatch.
+    Independent of online cost feedback and disabled by default."""
+
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
 

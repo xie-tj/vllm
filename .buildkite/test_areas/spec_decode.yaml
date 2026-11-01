@@ -41,6 +41,7 @@ steps:
   timeout_in_minutes: 30
   source_file_dependencies:
     - vllm/config/speculative.py
+    - vllm/config/kernel.py
     - vllm/distributed/
     - vllm/model_executor/models/qwen3_5.py
     - vllm/model_executor/models/qwen3_5_mtp.py
@@ -49,11 +50,13 @@ steps:
     - tests/v1/spec_decode/test_adaptive_verification.py
     - tests/v1/spec_decode/test_acceptance_estimator.py
     - tests/v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py
+    - tests/distributed/test_packed_moe_dispatch.py
   commands:
     - >-
       pytest -v -s
       v1/spec_decode/test_adaptive_verification.py::test_online_tp_dp_confidence_copies_do_not_block
       v1/spec_decode/test_acceptance_estimator.py::test_vocab_block_stats_match_full_logits
+      distributed/test_packed_moe_dispatch.py::test_packed_moe_dispatch_matches_native_payloads
     - >-
       pytest -v -s
       v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_vocab_sampling_registered_model_apis

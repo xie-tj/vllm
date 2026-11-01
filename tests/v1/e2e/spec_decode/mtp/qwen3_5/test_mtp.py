@@ -34,6 +34,7 @@ class VocabSamplingTestExtension:
     def prepare_vocab_equivalence(self):
         import torch
 
+        from vllm.distributed import get_ep_group
         from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
         from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
             compute_acceptance_partials,
@@ -90,8 +91,11 @@ class VocabSamplingTestExtension:
             [(1, 1.0), (512, 1.0)],
         )
         assert config.speculative_config is not None
+        comm = get_ep_group().device_communicator
+        assert comm is not None
         return {
             "vocab_statistics": runner.speculator.use_vocab_statistics,
+            "dispatch_packing": getattr(comm.all2all_manager, "pack_dispatch", False),
             "vocab_sampling_apis": (
                 hasattr(runner.model, "get_top_tokens")
                 and hasattr(runner.speculator.model, "compute_logits_local")
@@ -134,6 +138,8 @@ async def test_vocab_parallel_sampling_matches_native_tp4_dp2_ep(monkeypatch):
             "128",
             "--gpu-memory-utilization",
             "0.80",
+            "--kernel-config",
+            json.dumps({"enable_moe_dispatch_packing": optimized}),
             "--worker-extension-cls",
             f"{__name__}.VocabSamplingTestExtension",
             "--speculative-config",
@@ -180,11 +186,12 @@ async def test_vocab_parallel_sampling_matches_native_tp4_dp2_ep(monkeypatch):
                     for s in (row if isinstance(row, list) else [row])
                 ]
                 assert all(s.pop("vocab_statistics") == optimized for s in states)
+                assert all(s.pop("dispatch_packing") == optimized for s in states)
                 assert all(s.pop("vocab_sampling_apis") for s in states)
                 configurations.append(states)
                 constrained = await client.completions.create(
                     model="vocab-av",
-                    prompt="Continue.",
+                    prompt=["Continue."] * 16,
                     temperature=0,
                     max_tokens=16,
                     extra_body={
@@ -193,7 +200,10 @@ async def test_vocab_parallel_sampling_matches_native_tp4_dp2_ep(monkeypatch):
                         "return_token_ids": True,
                     },
                 )
-                assert constrained.choices[0].token_ids == [42] * 16
+                assert len(constrained.choices) == 16
+                assert all(
+                    choice.token_ids == [42] * 16 for choice in constrained.choices
+                )
                 tokens = []
                 for prompt in (
                     "The number after one is",

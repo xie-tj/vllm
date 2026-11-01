@@ -263,3 +263,12 @@ backend, graph, cache, JIT and local-argmax settings unchanged. It does not alte
 startup routing, cost calibration, or driver-only runtime timing. Compare both
 optimized AV and optimized AV with feedback against a native AV control using
 the same proposal limit to distinguish sampling gains from feedback gains.
+
+For CUDA `allgather_reducescatter` modular MoE dispatch, set
+`"enable_moe_dispatch_packing": true` in `--kernel-config` to pack four row tensors
+into a single byte payload. Activations, top-k weights and ids, and scales retain
+their original bits, dtypes, ordering and contiguous output layouts. No extra
+quantization is applied. The existing expert backend, shared gate, routing,
+cache and JIT settings remain in effect. Small balanced payloads and unsupported
+tensor formats keep native dispatch. This independent option defaults to false;
+its common performance gain must be reported separately from cost feedback.

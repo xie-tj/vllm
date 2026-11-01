@@ -12,7 +12,8 @@ import pytest
 
 from tests.utils import RemoteOpenAIServer, multi_gpu_test, single_gpu_only
 from vllm import SamplingParams
-from vllm.config import CompilationConfig, CUDAGraphMode, KernelConfig
+from vllm.config import CompilationConfig, CUDAGraphMode, KernelConfig, ModelConfig
+from vllm.model_executor.models.registry import ModelRegistry
 from vllm.platforms import current_platform
 
 from ...utils import (
@@ -30,20 +31,71 @@ if TYPE_CHECKING:
 class VocabSamplingTestExtension:
     model_runner: "GPUModelRunner"
 
-    def full_verification_for_equivalence(self):
+    def prepare_vocab_equivalence(self):
+        import torch
+
+        from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+        from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+            compute_acceptance_partials,
+        )
+        from vllm.v1.worker.gpu.spec_decode.vocab_stats import gather_draft_statistics
+
         runner = self.model_runner
         assert runner.adaptive_verification is not None
         assert runner.speculator is not None
-        # Keep identical model shapes across both servers. These artificial
-        # costs serve equivalence testing only, never performance measurement.
+        config = runner.vllm_config
+        assert config.model_config is not None
+        width = config.model_config.hf_text_config.hidden_size
+        hidden = (
+            (torch.arange(2 * width, device=runner.device).reshape(2, width) % 37 - 18)
+            / 32
+        ).to(config.model_config.dtype)
+        mapping = torch.arange(2, device=runner.device)
+        temperature = torch.zeros(2, device=runner.device)
+        seeds = torch.zeros(2, dtype=torch.int64, device=runner.device)
+        target_logits = runner.model.compute_logits(hidden)
+        assert target_logits is not None
+        target_ids = runner.model.get_top_tokens(hidden)
+        assert torch.equal(target_ids, target_logits.argmax(-1))
+        assert torch.equal(
+            target_ids,
+            gumbel_sample(
+                target_logits,
+                mapping,
+                temperature,
+                seeds,
+                mapping,
+                apply_temperature=False,
+                is_drafting=False,
+            ),
+        )
+        draft_logits = runner.speculator.model.compute_logits(hidden)
+        assert draft_logits is not None
+        ids, maxima, sums = gather_draft_statistics(
+            runner.speculator.model.compute_logits_local(hidden),
+            mapping,
+            temperature,
+            draft_logits.shape[-1],
+        )
+        ref_maxima, ref_sums = compute_acceptance_partials(
+            draft_logits, mapping, temperature
+        )
+        assert torch.equal(ids, draft_logits.argmax(-1))
+        torch.testing.assert_close(maxima, ref_maxima, rtol=0, atol=0)
+        torch.testing.assert_close(sums, ref_sums, rtol=0, atol=0)
+        # Keep identical flat startup prices across servers. Verification stays
+        # adaptive; DP routing is pinned below. Never use these prices for perf.
         runner.adaptive_verification.set_cost_curves(
             [(1, 0.0), (128, 0.0)],
-            [(n, 1.0 / n) for n in range(1, 513)],
+            [(1, 1.0), (512, 1.0)],
         )
-        config = runner.vllm_config
         assert config.speculative_config is not None
         return {
             "vocab_statistics": runner.speculator.use_vocab_statistics,
+            "vocab_sampling_apis": (
+                hasattr(runner.model, "get_top_tokens")
+                and hasattr(runner.speculator.model, "compute_logits_local")
+            ),
             "local_argmax": config.speculative_config.use_local_argmax_reduction,
             "batch_sharding": runner.batch_sharder is not None,
             "prefix_caching": config.cache_config.enable_prefix_caching,
@@ -109,10 +161,15 @@ async def test_vocab_parallel_sampling_matches_native_tp4_dp2_ep(monkeypatch):
             },
             max_wait_seconds=900,
         ) as server:
-            async with server.get_async_client() as client, httpx.AsyncClient() as rpc:
+            async with (
+                server.get_async_client(
+                    default_headers={"X-data-parallel-rank": "0"}
+                ) as client,
+                httpx.AsyncClient() as rpc,
+            ):
                 response = await rpc.post(
                     server.url_for("collective_rpc"),
-                    json={"method": "full_verification_for_equivalence"},
+                    json={"method": "prepare_vocab_equivalence"},
                     timeout=120,
                 )
                 response.raise_for_status()
@@ -123,6 +180,7 @@ async def test_vocab_parallel_sampling_matches_native_tp4_dp2_ep(monkeypatch):
                     for s in (row if isinstance(row, list) else [row])
                 ]
                 assert all(s.pop("vocab_statistics") == optimized for s in states)
+                assert all(s.pop("vocab_sampling_apis") for s in states)
                 configurations.append(states)
                 constrained = await client.completions.create(
                     model="vocab-av",
@@ -149,6 +207,15 @@ async def test_vocab_parallel_sampling_matches_native_tp4_dp2_ep(monkeypatch):
                         extra_body={"ignore_eos": True, "return_token_ids": True},
                     )
                     assert len(output.choices[0].token_ids) == 32
+                    reference = await client.completions.create(
+                        model="vocab-av",
+                        prompt=prompt,
+                        temperature=0,
+                        max_tokens=32,
+                        logprobs=0,
+                        extra_body={"ignore_eos": True, "return_token_ids": True},
+                    )
+                    assert output.choices[0].token_ids == reference.choices[0].token_ids
                     tokens.append(output.choices[0].token_ids)
                 results.append(tokens)
                 scored = await client.completions.create(
@@ -162,6 +229,24 @@ async def test_vocab_parallel_sampling_matches_native_tp4_dp2_ep(monkeypatch):
                 assert len(scored.choices[0].logprobs.token_logprobs) == 4
     assert configurations[0] == configurations[1]
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize(
+    ("architecture", "method"),
+    [
+        ("Qwen3_5MoeForCausalLM", "get_top_tokens"),
+        ("Qwen3_5MoeForConditionalGeneration", "get_top_tokens"),
+        ("Qwen3_5MoeMTP", "compute_logits_local"),
+    ],
+)
+def test_vocab_sampling_registered_model_apis(architecture, method):
+    """The platform-selected class must expose the optimization's model APIs."""
+    model = os.environ.get("VLLM_TEST_MOE_MTP_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
+    config = ModelConfig(model=model, max_model_len=512)
+    cls, _ = ModelRegistry.resolve_model_cls(architecture, config)
+    assert callable(getattr(cls, method, None)), (
+        f"{cls.__module__}.{cls.__name__}.{method}"
+    )
 
 
 @pytest.mark.parametrize(

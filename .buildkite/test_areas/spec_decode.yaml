@@ -44,6 +44,7 @@ steps:
     - vllm/distributed/
     - vllm/model_executor/models/qwen3_5.py
     - vllm/model_executor/models/qwen3_5_mtp.py
+    - vllm/models/qwen3_5/
     - vllm/v1/worker/gpu/
     - tests/v1/spec_decode/test_adaptive_verification.py
     - tests/v1/spec_decode/test_acceptance_estimator.py
@@ -53,7 +54,10 @@ steps:
       pytest -v -s
       v1/spec_decode/test_adaptive_verification.py::test_online_tp_dp_confidence_copies_do_not_block
       v1/spec_decode/test_acceptance_estimator.py::test_vocab_block_stats_match_full_logits
-    - pytest -v -s v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_vocab_parallel_sampling_matches_native_tp4_dp2_ep
+    - >-
+      pytest -v -s
+      v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_vocab_sampling_registered_model_apis
+      v1/e2e/spec_decode/mtp/qwen3_5/test_mtp.py::test_vocab_parallel_sampling_matches_native_tp4_dp2_ep
 
 - label: ":nvidia: (H100) Online AV TP and DP"
   key: online-av-tp-dp
